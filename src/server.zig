@@ -23,7 +23,8 @@ pub fn serve(
 
     while (true) {
         const conn = try srv.accept();
-        handleConnection(allocator, store, agents, explorer, conn, prerender);
+        const t = try std.Thread.spawn(.{}, handleConnection, .{ allocator, store, agents, explorer, conn, prerender });
+        t.detach();
     }
 }
 
@@ -719,7 +720,9 @@ fn findUnescapedQuote(s: []const u8, start: usize) ?usize {
 
 /// Minimal JSON string extractor: finds "key":"value" and returns value.
 fn extractJsonString(json: []const u8, key: []const u8) ?[]const u8 {
-    // Search for "key":"
+    // NOTE: This is a naive scanner that does NOT handle JSON escape sequences
+    // (e.g. \" inside string values will cause incorrect results). For correct
+    // parsing use std.json.parseFromSlice on the full body instead.
     var pos: usize = 0;
     while (pos < json.len) {
         const key_start = std.mem.indexOfPos(u8, json, pos, "\"") orelse return null;

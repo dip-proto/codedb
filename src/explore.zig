@@ -31,7 +31,6 @@ pub const FileOutline = struct {
     byte_size: u64,
     symbols: std.ArrayList(Symbol) = .{},
     imports: std.ArrayList([]const u8) = .{},
-    imported_by: std.ArrayList([]const u8) = .{},
     allocator: std.mem.Allocator,
     owns_path: bool = false,
 
@@ -53,7 +52,6 @@ pub const FileOutline = struct {
         self.symbols.deinit(self.allocator);
         for (self.imports.items) |imp| self.allocator.free(imp);
         self.imports.deinit(self.allocator);
-        self.imported_by.deinit(self.allocator);
     }
 };
 
@@ -535,7 +533,8 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
                     .struct_def
                 else if (std.mem.indexOf(u8, line, "enum {") != null)
                     .enum_def
-                else if (std.mem.indexOf(u8, line, "union") != null)
+                else if (std.mem.indexOf(u8, line, "union {") != null or
+                    std.mem.indexOf(u8, line, "union(enum) {") != null)
                     .union_def
                 else if (std.mem.indexOf(u8, line, "@import") != null)
                     .import

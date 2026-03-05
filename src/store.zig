@@ -101,7 +101,9 @@ pub const Store = struct {
         const max_versions = 100;
         if (entry.value_ptr.versions.items.len > max_versions) {
             const excess = entry.value_ptr.versions.items.len - max_versions;
-            entry.value_ptr.versions.replaceRange(self.allocator, 0, excess, &.{}) catch {};
+            // Single-pass O(n) shift: avoids replaceRange allocator overhead
+            std.mem.copyForwards(Version, entry.value_ptr.versions.items[0..max_versions], entry.value_ptr.versions.items[excess..]);
+            entry.value_ptr.versions.items.len = max_versions;
         }
 
         return next_seq;
@@ -139,6 +141,10 @@ pub const Store = struct {
         return count;
     }
 
+    /// Returns all files changed since `since` seq with one entry per file (latest change).
+    /// NOTE: returned `path` fields borrow into the store's internal hash map memory.
+    /// Do not use them after any write operation (recordSnapshot/recordEdit/recordDelete)
+    /// that may rehash the map and invalidate the pointers.
     pub fn changesSinceDetailed(self: *Store, since: u64, allocator: std.mem.Allocator) ![]const ChangeEntry {
         self.mu.lock();
         defer self.mu.unlock();

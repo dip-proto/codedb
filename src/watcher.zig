@@ -44,11 +44,12 @@ pub const EventQueue = struct {
         self.mu.lock();
         defer self.mu.unlock();
 
+        // Mutex provides the memory ordering guarantee; .monotonic is sufficient here.
         const cur_tail = self.tail.load(.monotonic);
         const next_tail = (cur_tail + 1) % CAPACITY;
-        if (next_tail == self.head.load(.acquire)) return false;
+        if (next_tail == self.head.load(.monotonic)) return false;
         self.events[cur_tail] = event;
-        self.tail.store(next_tail, .release);
+        self.tail.store(next_tail, .monotonic);
         return true;
     }
 
@@ -56,10 +57,11 @@ pub const EventQueue = struct {
         self.mu.lock();
         defer self.mu.unlock();
 
+        // Mutex provides the memory ordering guarantee; .monotonic is sufficient here.
         const cur_head = self.head.load(.monotonic);
-        if (cur_head == self.tail.load(.acquire)) return null;
+        if (cur_head == self.tail.load(.monotonic)) return null;
         const event = self.events[cur_head];
-        self.head.store((cur_head + 1) % CAPACITY, .release);
+        self.head.store((cur_head + 1) % CAPACITY, .monotonic);
         return event;
     }
 };
@@ -264,7 +266,9 @@ fn indexFileOutline(explorer: *Explorer, dir: std.fs.Dir, path: []const u8, allo
 
 /// Background thread: polls for incremental FS changes.
 pub fn incrementalLoop(store: *Store, explorer: *Explorer, queue: *EventQueue, root: []const u8, prerender: *Prerender, shutdown: *std.atomic.Value(bool)) void {
-    const backing = std.heap.page_allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const backing = gpa.allocator();
 
     var known = FileMap.init(backing);
     defer {
