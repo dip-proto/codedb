@@ -26,6 +26,7 @@ const html =
     \\  <link rel="preconnect" href="https://fonts.googleapis.com">
     \\  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     \\  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    \\  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     \\  <style>
     \\    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     \\    :root {
@@ -95,6 +96,11 @@ const html =
     \\    .bench-table .fast { color: var(--accent); font-weight: 600; }
     \\    .bench-table .na { color: var(--border); }
     \\    .table-note { font-size: 12px; color: var(--muted); font-family: var(--mono); margin: -36px 0 48px; }
+    \\    .chart-row { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; margin: 48px 0; }
+    \\    @media (max-width: 700px) { .chart-row { grid-template-columns: 1fr; } }
+    \\    .chart-card { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 24px; }
+    \\    .chart-card h3 { font-family: var(--display); font-size: 15px; font-weight: 700; color: var(--dark); margin-bottom: 16px; }
+    \\    .chart-card canvas { width: 100% !important; height: 280px !important; }
     \\
     \\    /* Feature matrix section */
     \\    .matrix-section { background: var(--bg2); padding: 80px 40px; }
@@ -245,6 +251,27 @@ const html =
     \\        <tr><td>vitessio/vitess</td><td>5,028</td><td>2.18M</td><td class="fast">50 s</td><td>9.95 ms</td></tr>
     \\      </tbody>
     \\    </table>
+    \\
+    \\    <div class="chart-row">
+    \\      <div class="chart-card">
+    \\        <h3>Query Latency (ms, log scale)</h3>
+    \\        <canvas id="latencyChart"></canvas>
+    \\      </div>
+    \\      <div class="chart-card">
+    \\        <h3>Token Efficiency (search &lsquo;allocator&rsquo;)</h3>
+    \\        <canvas id="tokenChart"></canvas>
+    \\      </div>
+    \\    </div>
+    \\    <div class="chart-row">
+    \\      <div class="chart-card">
+    \\        <h3>Indexing Speed by Repo Size</h3>
+    \\        <canvas id="indexChart"></canvas>
+    \\      </div>
+    \\      <div class="chart-card">
+    \\        <h3>MCP Speedup vs CLI</h3>
+    \\        <canvas id="speedupChart"></canvas>
+    \\      </div>
+    \\    </div>
     \\  </div>
     \\</div>
     \\
@@ -331,6 +358,18 @@ const html =
     \\  burger.addEventListener('click', function() { burger.classList.toggle('open'); links.classList.toggle('open'); });
     \\  links.querySelectorAll('a').forEach(function(a) { a.addEventListener('click', function() { burger.classList.remove('open'); links.classList.remove('open'); }); });
     \\})();
+    \\
+    \\// Latency chart (log scale)
+    \\new Chart(document.getElementById('latencyChart'),{type:'bar',data:{labels:['Tree','Symbol','Search','Word','Outline','Deps'],datasets:[{label:'codedb MCP',data:[0.04,0.10,0.05,0.04,0.05,0.05],backgroundColor:'#3b82f6'},{label:'ast-grep',data:[3.7,3.2,3.2,null,3.1,null],backgroundColor:'#f59e0b'},{label:'ripgrep',data:[null,6.3,5.3,7.2,null,null],backgroundColor:'#6b7280'},{label:'grep',data:[null,6.5,6.6,6.5,2.4,null],backgroundColor:'#9ca3af'}]},options:{responsive:true,maintainAspectRatio:false,scales:{y:{type:'logarithmic',title:{display:true,text:'ms (log)',font:{family:'JetBrains Mono',size:11}},grid:{color:'#eee'}}},plugins:{legend:{position:'bottom',labels:{font:{family:'Inter',size:11},usePointStyle:true,pointStyle:'circle'}}}}});
+    \\
+    \\// Token chart
+    \\new Chart(document.getElementById('tokenChart'),{type:'bar',data:{labels:['codedb2','merjs'],datasets:[{label:'codedb MCP',data:[20,20],backgroundColor:'#3b82f6'},{label:'ripgrep/grep',data:[32564,4007],backgroundColor:'#9ca3af'}]},options:{responsive:true,maintainAspectRatio:false,scales:{y:{title:{display:true,text:'tokens',font:{family:'JetBrains Mono',size:11}},grid:{color:'#eee'}}},plugins:{legend:{position:'bottom',labels:{font:{family:'Inter',size:11},usePointStyle:true,pointStyle:'circle'}}}}});
+    \\
+    \\// Indexing chart
+    \\new Chart(document.getElementById('indexChart'),{type:'bar',data:{labels:['codedb2\n20 files','merjs\n100 files','openclaw\n11.3k files','vitess\n5k files'],datasets:[{label:'Cold start',data:[0.017,0.016,75,50],backgroundColor:'#3b82f6'}]},options:{responsive:true,maintainAspectRatio:false,scales:{y:{type:'logarithmic',title:{display:true,text:'seconds (log)',font:{family:'JetBrains Mono',size:11}},grid:{color:'#eee'}}},plugins:{legend:{display:false}}}});
+    \\
+    \\// Speedup chart
+    \\new Chart(document.getElementById('speedupChart'),{type:'bar',data:{labels:['Tree','Symbol','Search','Word','Outline','Deps'],datasets:[{label:'MCP vs CLI speedup',data:[1253,549,1340,1404,1143,45],backgroundColor:['#3b82f6','#3b82f6','#3b82f6','#3b82f6','#3b82f6','#60a5fa']}]},options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',scales:{x:{title:{display:true,text:'speedup (x)',font:{family:'JetBrains Mono',size:11}},grid:{color:'#eee'}}},plugins:{legend:{display:false}}}});
     \\</script>
     \\</body>
     \\</html>
