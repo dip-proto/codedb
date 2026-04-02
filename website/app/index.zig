@@ -294,7 +294,7 @@ const html =
     \\      <tr><td>codedb</td><td>20</td><td>12.6k</td><td class="fast">17 ms</td><td>0.85 ms</td></tr>
     \\      <tr><td>merjs</td><td>100</td><td>17.3k</td><td class="fast">16 ms</td><td>0.16 ms</td></tr>
     \\      <tr><td>openclaw</td><td>11,281</td><td>2.29M</td><td class="fast">2.9 s</td><td>6.66 ms</td></tr>
-    \\      <tr><td>vitess</td><td>5,028</td><td>2.18M</td><td class="fast">50 s</td><td>9.95 ms</td></tr>
+    \\      <tr><td>vitess</td><td>5,028</td><td>2.18M</td><td class="fast">~2 s</td><td>0.40 ms</td></tr>
     \\    </tbody>
     \\  </table>
     \\  <p style="font-size:12px;color:var(--muted);font-family:var(--mono);">After startup, file watcher keeps indexes updated. Single-file re-index: &lt;2ms.</p>
