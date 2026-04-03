@@ -660,6 +660,7 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
                 const fc = explorer.outlines.count();
                 if (fc > 1000 or std.process.hasEnvVarConstant("CODEDB_LOW_MEMORY")) {
                     explorer.releaseContents();
+                    explorer.releaseSecondaryIndexes();
                 }
                 return;
             }
@@ -690,6 +691,7 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
     const file_count = explorer.outlines.count();
     if (file_count > 1000 or std.process.hasEnvVarConstant("CODEDB_LOW_MEMORY")) {
         explorer.releaseContents();
+        explorer.releaseSecondaryIndexes();
     }
 }
 }
