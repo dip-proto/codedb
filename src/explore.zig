@@ -116,6 +116,7 @@ pub const Explorer = struct {
     sparse_ngram_index: SparseNgramIndex,
     allocator: std.mem.Allocator,
     mu: std.Thread.RwLock = .{},
+    root_dir: ?std.fs.Dir = null,
 
     pub fn init(allocator: std.mem.Allocator) Explorer {
         return .{
@@ -127,6 +128,10 @@ pub const Explorer = struct {
             .sparse_ngram_index = SparseNgramIndex.init(allocator),
             .allocator = allocator,
         };
+    }
+
+    pub fn setRoot(self: *Explorer, root_path: []const u8) void {
+        self.root_dir = std.fs.cwd().openDir(root_path, .{}) catch null;
     }
 
 
@@ -153,6 +158,7 @@ pub const Explorer = struct {
         self.word_index.deinit();
         self.trigram_index.deinit();
         self.sparse_ngram_index.deinit();
+        if (self.root_dir) |*d| d.close();
     }
 
     /// Release all cached file contents to free memory after indexing is complete.
@@ -341,12 +347,11 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
-        // Try cached content first
         if (self.contents.get(path)) |content| {
             return try allocator.dupe(u8, content);
         }
-        // Fall back to disk read (contents may have been released)
-        const file = std.fs.cwd().openFile(path, .{}) catch return null;
+        const dir = self.root_dir orelse std.fs.cwd();
+        const file = dir.openFile(path, .{}) catch return null;
         defer file.close();
         return file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null;
     }
@@ -354,12 +359,11 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
     /// Read file content: try in-memory cache first, fall back to disk.
     /// Caller owns the returned slice and must free it.
     fn readContentForSearch(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
-        // Try cached content first (fast path)
         if (self.contents.get(path)) |cached| {
             return allocator.dupe(u8, cached) catch null;
         }
-        // Fall back to disk read
-        const file = std.fs.cwd().openFile(path, .{}) catch return null;
+        const dir = self.root_dir orelse std.fs.cwd();
+        const file = dir.openFile(path, .{}) catch return null;
         defer file.close();
         return file.readToEndAlloc(allocator, 512 * 1024) catch null;
     }

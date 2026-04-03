@@ -139,6 +139,7 @@ fn mainImpl() !void {
     };
 
     var explorer = Explorer.init(allocator);
+    explorer.setRoot(root);
     defer explorer.deinit();
 
     // Per-project frequency table for sparse n-gram boundary selection.
