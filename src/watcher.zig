@@ -1,7 +1,7 @@
 const std = @import("std");
 const Store = @import("store.zig").Store;
 const Explorer = @import("explore.zig").Explorer;
-
+const git_mod = @import("git.zig");
 pub const EventKind = enum(u8) {
     created,
     modified,
@@ -310,12 +310,51 @@ pub fn incrementalLoop(store: *Store, explorer: *Explorer, queue: *EventQueue, r
         }
     }
 
+    // Track current git HEAD to detect branch switches (#116)
+    var last_git_head: ?[40]u8 = git_mod.getGitHead(root, backing) catch null;
+
     while (!shutdown.load(.acquire)) {
         // Check for muonry edit notifications (instant re-index, no 2s delay)
         drainNotifyFile(store, explorer, queue, &known, root, backing);
 
         // Poll every 2s — gentle on CPU, fast enough to catch saves
         std.Thread.sleep(2 * std.time.ns_per_s);
+
+        // Check if git HEAD changed (branch switch, checkout, rebase)
+        const current_head = git_mod.getGitHead(root, backing) catch null;
+        const head_changed = blk: {
+            if (last_git_head == null and current_head == null) break :blk false;
+            if (last_git_head == null or current_head == null) break :blk true;
+            break :blk !std.mem.eql(u8, &last_git_head.?, &current_head.?);
+        };
+
+        if (head_changed) {
+            std.log.info("git HEAD changed — re-scanning", .{});
+            last_git_head = current_head;
+
+            // Full re-scan: clear known files and re-index everything
+            var kiter = known.iterator();
+            while (kiter.next()) |kv| backing.free(kv.key_ptr.*);
+            known.clearRetainingCapacity();
+
+            // Re-scan
+            var rescan_arena = std.heap.ArenaAllocator.init(backing);
+            defer rescan_arena.deinit();
+            const tmp = rescan_arena.allocator();
+            var dir = std.fs.cwd().openDir(root, .{ .iterate = true }) catch continue;
+            defer dir.close();
+            var walker = FilteredWalker.init(dir, tmp) catch continue;
+            defer walker.deinit();
+            while (walker.next() catch null) |entry| {
+                const stat = dir.statFile(entry.path) catch continue;
+                _ = store.recordSnapshot(entry.path, stat.size, 0) catch {};
+                indexFileContent(explorer, dir, entry.path, backing, false) catch {};
+                const mtime: i64 = @intCast(@divTrunc(stat.mtime, std.time.ns_per_ms));
+                const duped = backing.dupe(u8, entry.path) catch continue;
+                known.put(duped, .{ .mtime = mtime, .size = stat.size, .hash = 0, .seen = false }) catch backing.free(duped);
+            }
+            continue;
+        }
 
         // Each diff cycle gets its own arena so temporaries are freed
         var cycle_arena = std.heap.ArenaAllocator.init(backing);
