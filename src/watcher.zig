@@ -220,8 +220,9 @@ const FilteredWalker = struct {
             }
             // Exact name match (matches at any depth)
             if (std.mem.eql(u8, name, pattern)) return true;
-            // Path prefix match
-            if (std.mem.startsWith(u8, full_path, pattern)) return true;
+            // Path prefix match (must match at / boundary)
+            if (std.mem.startsWith(u8, full_path, pattern) and
+                (full_path.len == pattern.len or full_path[pattern.len] == '/')) return true;
             // Glob suffix match (e.g. *.log)
             if (pattern.len > 1 and pattern[0] == '*') {
                 if (std.mem.endsWith(u8, name, pattern[1..])) return true;
@@ -396,12 +397,23 @@ pub fn incrementalLoop(store: *Store, explorer: *Explorer, queue: *EventQueue, r
             std.log.info("git HEAD changed — re-scanning", .{});
             last_git_head = current_head;
 
-            // Full re-scan: clear known files and re-index everything
+            // Remove stale files from Explorer that may not exist on the new branch
+            var remove_list: std.ArrayList([]const u8) = .{};
+            defer remove_list.deinit(backing);
             var kiter = known.iterator();
-            while (kiter.next()) |kv| backing.free(kv.key_ptr.*);
+            while (kiter.next()) |kv| {
+                remove_list.append(backing, kv.key_ptr.*) catch {};
+            }
+            for (remove_list.items) |path| {
+                explorer.removeFile(path);
+            }
+
+            // Clear known map
+            var kiter2 = known.iterator();
+            while (kiter2.next()) |kv| backing.free(kv.key_ptr.*);
             known.clearRetainingCapacity();
 
-            // Re-scan
+            // Re-scan with trigram cap
             var rescan_arena = std.heap.ArenaAllocator.init(backing);
             defer rescan_arena.deinit();
             const tmp = rescan_arena.allocator();
@@ -409,10 +421,14 @@ pub fn incrementalLoop(store: *Store, explorer: *Explorer, queue: *EventQueue, r
             defer dir.close();
             var walker = FilteredWalker.init(dir, tmp) catch continue;
             defer walker.deinit();
+            const max_trigram_files: usize = 15_000;
+            var file_count: usize = 0;
             while (walker.next() catch null) |entry| {
                 const stat = dir.statFile(entry.path) catch continue;
                 _ = store.recordSnapshot(entry.path, stat.size, 0) catch {};
-                indexFileContent(explorer, dir, entry.path, backing, false) catch {};
+                file_count += 1;
+                const effective_skip = file_count > max_trigram_files;
+                indexFileContent(explorer, dir, entry.path, backing, effective_skip) catch {};
                 const mtime: i64 = @intCast(@divTrunc(stat.mtime, std.time.ns_per_ms));
                 const duped = backing.dupe(u8, entry.path) catch continue;
                 known.put(duped, .{ .mtime = mtime, .size = stat.size, .hash = 0, .seen = false }) catch backing.free(duped);
