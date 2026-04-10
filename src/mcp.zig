@@ -17,6 +17,7 @@ const edit_mod = @import("edit.zig");
 const idx = @import("index.zig");
 const snapshot_mod = @import("snapshot.zig");
 const telemetry_mod = @import("telemetry.zig");
+const git_mod = @import("git.zig");
 const root_policy = @import("root_policy.zig");
 // ── Project cache ────────────────────────────────────────────────────────────
 
@@ -24,6 +25,78 @@ const ProjectCtx = struct {
     explorer: *Explorer,
     store: *Store,
 };
+
+fn getProjectDataDir(allocator: std.mem.Allocator, project_path: []const u8) ?[]u8 {
+    const hash = std.hash.Wyhash.hash(0, project_path);
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch {
+        return std.fmt.allocPrint(allocator, "{s}/.codedb", .{project_path}) catch null;
+    };
+    defer allocator.free(home);
+
+    return std.fmt.allocPrint(allocator, "{s}/.codedb/projects/{x}", .{ home, hash }) catch null;
+}
+
+fn loadProjectTrigramFromDiskIfPresent(explorer: *Explorer, project_path: []const u8, allocator: std.mem.Allocator) void {
+    explorer.mu.lockShared();
+    const already_loaded = explorer.trigram_index.fileCount() > 0;
+    explorer.mu.unlockShared();
+    if (already_loaded) return;
+
+    const data_dir = getProjectDataDir(allocator, project_path) orelse return;
+    defer allocator.free(data_dir);
+
+    if (idx.MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
+        explorer.mu.lock();
+        defer explorer.mu.unlock();
+        explorer.trigram_index.deinit();
+        explorer.trigram_index = .{ .mmap = loaded };
+    } else if (idx.TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
+        explorer.mu.lock();
+        defer explorer.mu.unlock();
+        explorer.trigram_index.deinit();
+        explorer.trigram_index = .{ .heap = loaded };
+    }
+}
+
+fn loadProjectWordIndexFromDiskIfPresent(explorer: *Explorer, project_path: []const u8, allocator: std.mem.Allocator) void {
+    if (!explorer.wordIndexCanLoadFromDisk()) return;
+
+    const data_dir = getProjectDataDir(allocator, project_path) orelse {
+        explorer.disableWordIndexDiskLoad();
+        return;
+    };
+    defer allocator.free(data_dir);
+
+    const header = idx.WordIndex.readDiskHeader(data_dir, allocator) catch null orelse {
+        explorer.disableWordIndexDiskLoad();
+        return;
+    };
+
+    explorer.mu.lockShared();
+    const current_count = @as(u32, @intCast(explorer.outlines.count()));
+    explorer.mu.unlockShared();
+    if (header.file_count != current_count) {
+        explorer.disableWordIndexDiskLoad();
+        return;
+    }
+
+    const current_git_head = git_mod.getGitHead(project_path, allocator) catch null;
+    const heads_match = blk: {
+        if (current_git_head == null and header.git_head == null) break :blk true;
+        if (current_git_head == null or header.git_head == null) break :blk false;
+        break :blk std.mem.eql(u8, &current_git_head.?, &header.git_head.?);
+    };
+    if (!heads_match) {
+        explorer.disableWordIndexDiskLoad();
+        return;
+    }
+
+    if (idx.WordIndex.readFromDisk(data_dir, allocator)) |loaded| {
+        explorer.replaceWordIndex(loaded);
+    } else {
+        explorer.disableWordIndexDiskLoad();
+    }
+}
 
 const ProjectCache = struct {
     const MAX_CACHED = 5;
@@ -123,6 +196,8 @@ const ProjectCache = struct {
                 return error.SnapshotLoadFailed;
             }
         }
+
+        loadProjectTrigramFromDiskIfPresent(&new_entry.explorer, p, self.alloc);
 
         // Find free slot or evict LRU
         var target_slot: usize = 0;
@@ -259,6 +334,8 @@ pub const Tool = enum {
     codedb_remote,
     codedb_projects,
     codedb_index,
+    codedb_find,
+    codedb_query,
 };
 
 const tools_list =
@@ -278,7 +355,9 @@ const tools_list =
     \\{"name":"codedb_bundle","description":"Batch multiple queries in one call. Max 20 ops. WARNING: Avoid bundling multiple codedb_read calls on large files — use codedb_outline + codedb_symbol instead. Bundle outline+symbol+search, not full file reads. Total response is not size-capped, so large bundles can exceed token limits.","inputSchema":{"type":"object","properties":{"ops":{"type":"array","items":{"type":"object","properties":{"tool":{"type":"string","description":"Tool name (e.g. codedb_outline, codedb_symbol, codedb_read)"},"arguments":{"type":"object","description":"Tool arguments"}},"required":["tool"]},"description":"Array of tool calls to execute"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["ops"]}},
     \\{"name":"codedb_remote","description":"Query any GitHub repo via codedb.codegraff.com cloud intelligence. Gets file tree, symbol outlines, or searches code in external repos without cloning. Use when you need to understand a dependency, check an external API, or explore a repo you don't have locally.","inputSchema":{"type":"object","properties":{"repo":{"type":"string","description":"GitHub repo in owner/repo format (e.g. justrach/merjs)"},"action":{"type":"string","enum":["tree","outline","search","meta"],"description":"What to query: tree (file list), outline (symbols), search (text search), meta (repo info)"},"query":{"type":"string","description":"Search query (required when action=search)"}},"required":["repo","action"]}},
     \\{"name":"codedb_projects","description":"List all locally indexed projects on this machine. Shows project paths, data directory hashes, and whether a snapshot exists. Use to discover what codebases are available.","inputSchema":{"type":"object","properties":{},"required":[]}},
-    \\{"name":"codedb_index","description":"Index a local folder on this machine. Scans all source files, builds outlines/trigrams/word indexes, and creates a codedb.snapshot in the target directory. After indexing, the folder is queryable via the project param on any tool.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the folder to index (e.g. /Users/you/myproject)"}},"required":["path"]}}
+    \\{"name":"codedb_index","description":"Index a local folder on this machine. Scans all source files, builds outlines/trigrams/word indexes, and creates a codedb.snapshot in the target directory. After indexing, the folder is queryable via the project param on any tool.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the folder to index (e.g. /Users/you/myproject)"}},"required":["path"]}},
+    \\{"name":"codedb_find","description":"Fuzzy file search — finds files by approximate name. Typo-tolerant subsequence matching with word-boundary and filename bonuses. Use when you know roughly what file you're looking for but not the exact path. Much faster than codedb_tree + manual scan.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Fuzzy search query (e.g. 'authmidlware', 'test_auth', 'main.zig')"},"max_results":{"type":"integer","description":"Maximum results to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
+    \\{"name":"codedb_query","description":"Composable search pipeline — chain multiple operations where each step feeds the next. Replaces multi-tool workflows with a single call. Pipeline ops: find (fuzzy file search), search (content grep), filter (by extension/path glob), outline (get symbols), read (file contents), sort (by score/path), limit (truncate). Each step operates on the file set from the previous step.","inputSchema":{"type":"object","properties":{"pipeline":{"type":"array","items":{"type":"object"},"description":"Array of pipeline steps. Each step has 'op' (find/search/filter/outline/read/sort/limit) and op-specific params. Steps execute in order, each filtering/transforming the file set from the previous step."},"project":{"type":"string","description":"Optional absolute path to a different project"}},"required":["pipeline"]}}
     \\]}
 ;
 
@@ -299,6 +378,7 @@ const Session = struct {
     next_id: i64 = 100,
     client_supports_roots: bool = false,
     client_roots_list_changed: bool = false,
+    client_name: ?[]const u8 = null,
     pending_roots_id: ?i64 = null,
     roots: std.ArrayList(Root) = .empty,
 
@@ -403,8 +483,18 @@ fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.
         s.client_supports_roots = true;
         s.client_roots_list_changed = mcpj.getBool(&r.object, "listChanged");
     }
+    // Extract client identity for agent registration (#37)
+    client_name: {
+        const p = root.get("params") orelse break :client_name;
+        if (p != .object) break :client_name;
+        const ci = p.object.get("clientInfo") orelse break :client_name;
+        if (ci != .object) break :client_name;
+        if (mcpj.getStr(&ci.object, "name")) |name| {
+            s.client_name = name;
+        }
+    }
     writeResult(s.alloc, s.stdout, id,
-        \\{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"codedb","version":"0.2.3"}}
+        \\{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"codedb","version":"0.2.56"}}
     );
 }
 
@@ -523,6 +613,19 @@ fn handleCall(
 
     const is_error = std.mem.startsWith(u8, out.items, "error:");
     telem.recordToolCall(name, elapsed, is_error, out.items.len);
+
+    // Query + file access tracking WAL
+    if (!is_error) {
+        if (std.mem.eql(u8, name, "codedb_search") or std.mem.eql(u8, name, "codedb_find") or std.mem.eql(u8, name, "codedb_word")) {
+            if (getStr(args, "query") orelse getStr(args, "word")) |q| {
+                logQuery(name, q, out.items.len, elapsed);
+            }
+        } else if (std.mem.eql(u8, name, "codedb_read") or std.mem.eql(u8, name, "codedb_outline")) {
+            if (getStr(args, "path")) |p| {
+                logFileAccess(name, p, elapsed);
+            }
+        }
+    }
     if (is_notification) return;
 
     // Block 1: Human-readable colored summary (ANSI — preview pane always renders it)
@@ -584,6 +687,11 @@ fn dispatch(
         return;
     };
 
+    if (tool == .codedb_word) {
+        const effective_project = project_path orelse cache.default_path;
+        loadProjectWordIndexFromDiskIfPresent(ctx.explorer, effective_project, alloc);
+    }
+
     switch (tool) {
         .codedb_tree => handleTree(alloc, out, ctx.explorer),
         .codedb_outline => handleOutline(alloc, args, out, ctx.explorer),
@@ -601,6 +709,8 @@ fn dispatch(
         .codedb_remote => handleRemote(alloc, args, out),
         .codedb_projects => handleProjects(alloc, out),
         .codedb_index => handleIndex(alloc, args, out),
+        .codedb_find => handleFind(alloc, args, out, ctx.explorer),
+        .codedb_query => handleQuery(alloc, args, out, ctx.explorer, ctx.store),
     }
 }
 
@@ -736,9 +846,26 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
 
         const w = out.writer(alloc);
         w.print("{d} results for '{s}':\n", .{ results.len, query }) catch {};
+        var file_counts = std.StringHashMap(u8).init(alloc);
+        defer file_counts.deinit();
+        const max_per_file: u8 = 5;
+        var shown: usize = 0;
         for (results) |r| {
             if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
+            const gop = file_counts.getOrPut(r.path) catch continue;
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+            if (gop.value_ptr.* > max_per_file) {
+                if (gop.value_ptr.* == max_per_file + 1) {
+                    w.print("  {s}: ... (more matches truncated)\n", .{r.path}) catch {};
+                }
+                continue;
+            }
             w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+            shown += 1;
+        }
+        if (shown < results.len) {
+            w.print("({d} shown, {d} truncated)\n", .{ shown, results.len - shown }) catch {};
         }
     }
 }
@@ -957,14 +1084,41 @@ fn handleChanges(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
 }
 
 fn handleStatus(alloc: std.mem.Allocator, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {
-    _ = explorer;
     store.mu.lock();
     const file_count = store.files.count();
     store.mu.unlock();
+
+    const index_bytes = telemetry_mod.approxIndexSizeBytes(explorer);
+
+    explorer.mu.lockShared();
+    const outline_count = explorer.outlines.count();
+    const content_count = explorer.contents.count();
+    const trigram_type: []const u8 = switch (explorer.trigram_index) {
+        .heap => "heap",
+        .mmap => "mmap",
+        .mmap_overlay => "mmap+overlay",
+    };
+    const trigram_files = explorer.trigram_index.fileCount();
+    explorer.mu.unlockShared();
+
     const w = out.writer(alloc);
-    w.print("codedb status:\n  seq: {d}\n  files: {d}\n", .{
+    w.print(
+        \\codedb status:
+        \\  seq: {d}
+        \\  files: {d}
+        \\  outlines: {d}
+        \\  contents_cached: {d}
+        \\  trigram_index: {s} ({d} files)
+        \\  index_memory: {d}KB
+        \\
+    , .{
         store.currentSeq(),
         file_count,
+        outline_count,
+        content_count,
+        trigram_type,
+        trigram_files,
+        index_bytes / 1024,
     }) catch {};
 }
 
@@ -1072,7 +1226,10 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     const valid_actions = [_][]const u8{ "tree", "outline", "search", "meta" };
     var action_valid = false;
     for (valid_actions) |va| {
-        if (std.mem.eql(u8, action, va)) { action_valid = true; break; }
+        if (std.mem.eql(u8, action, va)) {
+            action_valid = true;
+            break;
+        }
     }
     if (!action_valid) {
         out.appendSlice(alloc, "error: invalid action, must be one of: tree, outline, search, meta") catch {};
@@ -1276,15 +1433,445 @@ fn handleIndex(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
     out.appendSlice(alloc, abs_path) catch {};
     if (result.stdout.len > 0) {
         out.appendSlice(alloc, "\n") catch {};
-        // Strip ANSI color codes from stdout for clean MCP output
-        for (result.stdout) |c| {
-            if (c == 0x1b) {
-                // Skip ESC sequences — handled below
+        // Strip ANSI escape sequences
+        var i: usize = 0;
+        while (i < result.stdout.len) {
+            if (result.stdout[i] == 0x1b) {
+                i += 1;
+                if (i < result.stdout.len and result.stdout[i] == '[') {
+                    // CSI sequence: skip until final byte (0x40-0x7E per ECMA-48)
+                    i += 1;
+                    while (i < result.stdout.len) {
+                        const ch = result.stdout[i];
+                        i += 1;
+                        if (ch >= 0x40 and ch <= 0x7E) break;
+                    }
+                } else if (i < result.stdout.len) {
+                    // Fe sequence (ESC + one byte) — skip
+                    i += 1;
+                }
+                // Lone ESC at end — already skipped by i += 1 above
             } else {
-                out.append(alloc, c) catch {};
+                out.append(alloc, result.stdout[i]) catch {};
+                i += 1;
             }
         }
     }
+}
+
+fn handleFind(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
+    const query = getStr(args, "query") orelse {
+        out.appendSlice(alloc, "error: missing 'query'") catch {};
+        return;
+    };
+    if (query.len == 0) {
+        out.appendSlice(alloc, "error: empty query") catch {};
+        return;
+    }
+
+    const max_results: usize = if (args.get("max_results")) |v| switch (v) {
+        .integer => |i| @intCast(@max(1, @min(i, 50))),
+        else => 10,
+    } else 10;
+
+    var matches = explorer.fuzzyFindFiles(query, alloc, max_results) catch {
+        out.appendSlice(alloc, "error: search failed") catch {};
+        return;
+    };
+    defer alloc.free(matches);
+
+    // Auto-retry: if no results, try broadening the query
+    var broadened_buf: [256]u8 = undefined;
+    if (matches.len == 0 and query.len > 3) {
+        // Try stripping delimiters: auth_middleware → authmiddleware
+        var blen: usize = 0;
+        for (query) |c| {
+            if (c != '_' and c != '-' and c != '.' and blen < broadened_buf.len) {
+                broadened_buf[blen] = c;
+                blen += 1;
+            }
+        }
+        if (blen > 0 and blen != query.len) {
+            const broadened = broadened_buf[0..blen];
+            const retry = explorer.fuzzyFindFiles(broadened, alloc, max_results) catch null;
+            if (retry) |r| {
+                alloc.free(matches);
+                matches = r;
+            }
+        }
+    }
+    // Combo-boost: reward files that were previously opened after similar queries
+    applyComboBoosts(alloc, query, @constCast(matches));
+
+    if (matches.len == 0) {
+        out.appendSlice(alloc, "no matches") catch {};
+        return;
+    }
+
+    for (matches, 1..) |m, rank| {
+        var buf: [16]u8 = undefined;
+        const rank_str = std.fmt.bufPrint(&buf, "{d}. ", .{rank}) catch continue;
+        out.appendSlice(alloc, rank_str) catch {};
+        out.appendSlice(alloc, m.path) catch {};
+        var score_buf: [32]u8 = undefined;
+        const score_str = std.fmt.bufPrint(&score_buf, " (score: {d:.2})\n", .{m.score}) catch continue;
+        out.appendSlice(alloc, score_str) catch {};
+    }
+}
+
+const COMBO_WINDOW_MS: i64 = 5000; // 5 second window between query and file open
+const COMBO_BOOST_PER_HIT: f32 = 5.0; // score boost per historical open
+
+fn applyComboBoosts(alloc: std.mem.Allocator, query: []const u8, matches: []explore_mod.Explorer.FuzzyMatch) void {
+    const wal_path = query_log_path orelse return;
+    const data = std.fs.cwd().readFileAlloc(alloc, wal_path, 512 * 1024) catch return;
+    defer alloc.free(data);
+
+    // Scan WAL for query→access pairs within COMBO_WINDOW_MS
+    var boosts = std.StringHashMap(f32).init(alloc);
+    defer boosts.deinit();
+
+    var last_query_ts: i64 = 0;
+    var last_query_match = false;
+
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line| {
+        if (line.len < 10) continue;
+
+        if (std.mem.indexOf(u8, line, "\"ev\":\"query\"")) |_| {
+            // Check if this query matches the current one (case-insensitive substring)
+            var qbuf: [256]u8 = undefined;
+            if (extractJsonStrLocal(line, "query", &qbuf)) |logged_query| {
+                last_query_match = std.mem.indexOf(u8, logged_query, query) != null or
+                    std.mem.indexOf(u8, query, logged_query) != null;
+            } else {
+                last_query_match = false;
+            }
+            last_query_ts = extractJsonIntLocal(line, "ts") orelse 0;
+        } else if (std.mem.indexOf(u8, line, "\"ev\":\"access\"")) |_| {
+            if (!last_query_match) continue;
+            const access_ts = extractJsonIntLocal(line, "ts") orelse continue;
+            if (access_ts - last_query_ts > COMBO_WINDOW_MS) continue;
+
+            var pbuf: [256]u8 = undefined;
+            if (extractJsonStrLocal(line, "path", &pbuf)) |path| {
+                const gop = boosts.getOrPut(path) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += COMBO_BOOST_PER_HIT;
+            }
+        }
+    }
+
+    if (boosts.count() == 0) return;
+
+    // Apply boosts to matching results
+    var boosted = false;
+    for (matches) |*m| {
+        if (boosts.get(m.path)) |boost| {
+            m.score += boost;
+            boosted = true;
+        }
+    }
+
+    // Re-sort if any scores changed
+    if (boosted) {
+        std.mem.sort(explore_mod.Explorer.FuzzyMatch, matches, {}, struct {
+            fn lt(_: void, a: explore_mod.Explorer.FuzzyMatch, b: explore_mod.Explorer.FuzzyMatch) bool {
+                return a.score > b.score;
+            }
+        }.lt);
+    }
+}
+
+fn extractJsonIntLocal(line: []const u8, key: []const u8) ?i64 {
+    var search_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
+    const pos = std.mem.indexOf(u8, line, needle) orelse return null;
+    const start = pos + needle.len;
+    var end = start;
+    while (end < line.len and (line[end] >= '0' and line[end] <= '9')) : (end += 1) {}
+    if (end == start) return null;
+    return std.fmt.parseInt(i64, line[start..end], 10) catch null;
+}
+
+fn extractJsonStrLocal(line: []const u8, key: []const u8, out: *[256]u8) ?[]const u8 {
+    var search_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{key}) catch return null;
+    const pos = std.mem.indexOf(u8, line, needle) orelse return null;
+    const start = pos + needle.len;
+    const end = std.mem.indexOfScalarPos(u8, line, start, '"') orelse return null;
+    const len = @min(end - start, out.len);
+    @memcpy(out[0..len], line[start..][0..len]);
+    return out[0..len];
+}
+
+fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer, store: *Store) void {
+    _ = store;
+    const pipeline_val = args.get("pipeline") orelse {
+        out.appendSlice(alloc, "error: missing 'pipeline' array") catch {};
+        return;
+    };
+    const pipeline = switch (pipeline_val) {
+        .array => |a| a.items,
+        else => {
+            out.appendSlice(alloc, "error: 'pipeline' must be an array") catch {};
+            return;
+        },
+    };
+    if (pipeline.len == 0 or pipeline.len > 10) {
+        out.appendSlice(alloc, "error: pipeline must have 1-10 steps") catch {};
+        return;
+    }
+
+    var file_set: std.ArrayList([]const u8) = .{};
+    defer file_set.deinit(alloc);
+    var have_set = false;
+    const w = out.writer(alloc);
+
+    for (pipeline, 0..) |step_val, step_i| {
+        if (step_val != .object) {
+            w.print("error: step {d} must be object\n", .{step_i}) catch {};
+            return;
+        }
+        const step = &step_val.object;
+        const op = getStr(step, "op") orelse {
+            w.print("error: step {d} missing 'op'\n", .{step_i}) catch {};
+            return;
+        };
+
+        if (std.mem.eql(u8, op, "find")) {
+            const query = getStr(step, "query") orelse { w.print("error: find needs 'query'\n", .{}) catch {}; return; };
+            const max: usize = if (getInt(step, "max_results")) |n| @intCast(@max(1, @min(n, 200))) else 50;
+            const matches = explorer.fuzzyFindFiles(query, alloc, max) catch { w.print("error: find failed\n", .{}) catch {}; return; };
+            defer alloc.free(matches);
+            if (have_set) {
+                // Intersect: keep only files from current set that also appear in find results
+                var match_set = std.StringHashMap(void).init(alloc);
+                defer match_set.deinit();
+                for (matches) |m| match_set.put(m.path, {}) catch {};
+                var wr: usize = 0;
+                for (file_set.items) |p| {
+                    if (match_set.contains(p)) { file_set.items[wr] = p; wr += 1; }
+                }
+                file_set.items.len = wr;
+            } else {
+                file_set.clearRetainingCapacity();
+                for (matches) |m| file_set.append(alloc, m.path) catch {};
+                have_set = true;
+            }
+        } else if (std.mem.eql(u8, op, "search")) {
+            const query = getStr(step, "query") orelse { w.print("error: search needs 'query'\n", .{}) catch {}; return; };
+            const max: usize = if (getInt(step, "max_results")) |n| @intCast(@max(1, @min(n, 200))) else 50;
+            const results = explorer.searchContent(query, alloc, max) catch { w.print("error: search failed\n", .{}) catch {}; return; };
+            defer {
+                for (results) |r| {
+                    alloc.free(r.line_text);
+                    alloc.free(r.path);
+                }
+                alloc.free(results);
+            }
+            if (have_set) {
+                // Intersect: only keep files from current set that have search hits
+                var hit_set = std.StringHashMap(void).init(alloc);
+                defer hit_set.deinit();
+                var path_set = std.StringHashMap(void).init(alloc);
+                defer path_set.deinit();
+                for (file_set.items) |p| path_set.put(p, {}) catch {};
+                for (results) |r| {
+                    if (path_set.contains(r.path)) {
+                        w.print("{s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+                        hit_set.put(r.path, {}) catch {};
+                    }
+                }
+                // Narrow file_set to only files that had hits
+                var wr: usize = 0;
+                for (file_set.items) |p| {
+                    if (hit_set.contains(p)) { file_set.items[wr] = p; wr += 1; }
+                }
+                file_set.items.len = wr;
+            } else {
+                var seen = std.StringHashMap(void).init(alloc);
+                defer seen.deinit();
+                file_set.clearRetainingCapacity();
+                for (results) |r| {
+                    w.print("{s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+                    if (!seen.contains(r.path)) {
+                        // Dupe path — search results are freed by the defer above,
+                        // but file_set must outlive this step for downstream ops
+                        const duped = alloc.dupe(u8, r.path) catch continue;
+                        seen.put(duped, {}) catch { alloc.free(duped); continue; };
+                        file_set.append(alloc, duped) catch { alloc.free(duped); continue; };
+                    }
+                }
+                have_set = true;
+            }
+        } else if (std.mem.eql(u8, op, "filter")) {
+            if (!have_set) {
+                explorer.mu.lockShared();
+                var iter = explorer.outlines.keyIterator();
+                while (iter.next()) |k| file_set.append(alloc, k.*) catch {};
+                explorer.mu.unlockShared();
+                have_set = true;
+            }
+            const ext = getStr(step, "ext");
+            const glob_pat = getStr(step, "glob");
+            var wr: usize = 0;
+            for (file_set.items) |path| {
+                var keep = true;
+                if (ext) |e| { if (!std.mem.endsWith(u8, path, e)) keep = false; }
+                if (keep) if (glob_pat) |g| { if (!globMatch(g, path)) keep = false; };
+                if (keep) { file_set.items[wr] = path; wr += 1; }
+            }
+            file_set.items.len = wr;
+        } else if (std.mem.eql(u8, op, "outline")) {
+            if (!have_set) { w.print("error: outline needs prior step\n", .{}) catch {}; return; }
+            for (file_set.items) |path| {
+                var outline = explorer.getOutline(path, alloc) catch continue;
+                if (outline) |*o| {
+                    defer o.deinit();
+                    w.print("--- {s} ({s}, {d} sym) ---\n", .{ path, @tagName(o.language), o.symbols.items.len }) catch {};
+                    for (o.symbols.items) |sym| w.print("  L{d} {s} {s}\n", .{ sym.line_start, @tagName(sym.kind), sym.name }) catch {};
+                }
+                if (out.items.len > 100 * 1024) { w.print("... truncated\n", .{}) catch {}; break; }
+            }
+        } else if (std.mem.eql(u8, op, "read")) {
+            if (!have_set) { w.print("error: read needs prior step\n", .{}) catch {}; return; }
+            const max_lines: usize = if (getInt(step, "lines")) |n| @intCast(@max(1, @min(n, 200))) else 50;
+            for (file_set.items) |path| {
+                const content = explorer.getContent(path, alloc) catch continue;
+                if (content) |data| {
+                    defer alloc.free(data);
+                    w.print("--- {s} ---\n", .{path}) catch {};
+                    var ln: usize = 1;
+                    var it = std.mem.splitScalar(u8, data, '\n');
+                    while (it.next()) |line| {
+                        if (ln > max_lines) { w.print("  ... (truncated)\n", .{}) catch {}; break; }
+                        w.print("{d:>4}| {s}\n", .{ ln, line }) catch {};
+                        ln += 1;
+                    }
+                }
+                if (out.items.len > 100 * 1024) { w.print("... truncated\n", .{}) catch {}; break; }
+            }
+        } else if (std.mem.eql(u8, op, "sort")) {
+            if (!have_set) { w.print("error: sort needs prior step\n", .{}) catch {}; return; }
+            const by = getStr(step, "by") orelse "path";
+            if (std.mem.eql(u8, by, "path")) {
+                std.mem.sort([]const u8, file_set.items, {}, struct {
+                    fn lt(_: void, a: []const u8, b: []const u8) bool {
+                        return std.mem.order(u8, a, b) == .lt;
+                    }
+                }.lt);
+            }
+            // "score" sorting is implicit from find — no re-sort needed
+        } else if (std.mem.eql(u8, op, "limit")) {
+            const n: usize = if (getInt(step, "n")) |i| @intCast(@max(1, @min(i, 100))) else 10;
+            if (file_set.items.len > n) file_set.items.len = n;
+        } else {
+            w.print("error: unknown op '{s}'\n", .{op}) catch {};
+            return;
+        }
+    }
+
+    if (out.items.len == 0 and have_set) {
+        w.print("{d} files:\n", .{file_set.items.len}) catch {};
+        for (file_set.items) |path| w.print("  {s}\n", .{path}) catch {};
+    }
+}
+
+
+
+// Query tracking — append-only WAL in ~/.codedb/projects/<hash>/queries.log
+var query_log_path: ?[]const u8 = null;
+
+pub fn setQueryLogPath(path: []const u8) void {
+    query_log_path = path;
+}
+
+fn escapeJsonStr(input: []const u8, out: *[256]u8) usize {
+    var elen: usize = 0;
+    for (input) |c| {
+        if (elen >= out.len - 1) break;
+        if (c == '"') { out[elen] = '\''; elen += 1; }
+        else if (c == '\\') { if (elen + 1 < out.len) { out[elen] = '\\'; out[elen + 1] = '\\'; elen += 2; } }
+        else if (c == '\n' or c == '\r' or c == '\t') { out[elen] = ' '; elen += 1; }
+        else { out[elen] = c; elen += 1; }
+    }
+    return elen;
+}
+
+fn appendToWal(line: []const u8) void {
+    const path = query_log_path orelse return;
+    const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch blk: {
+        break :blk std.fs.cwd().createFile(path, .{}) catch return;
+    };
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+    file.writeAll(line) catch {};
+}
+
+fn logQuery(tool: []const u8, query: []const u8, result_bytes: usize, latency_ns: i128) void {
+    var escaped: [256]u8 = undefined;
+    const elen = escapeJsonStr(query, &escaped);
+    const latency_us: i64 = @intCast(@divTrunc(latency_ns, 1000));
+    var buf: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "{{\"ts\":{d},\"ev\":\"query\",\"tool\":\"{s}\",\"query\":\"{s}\",\"result_bytes\":{d},\"latency_us\":{d}}}\n", .{
+        std.time.milliTimestamp(), tool, escaped[0..elen], result_bytes, latency_us,
+    }) catch return;
+    appendToWal(line);
+}
+
+fn logFileAccess(tool: []const u8, file_path: []const u8, latency_ns: i128) void {
+    var escaped: [256]u8 = undefined;
+    const elen = escapeJsonStr(file_path, &escaped);
+    const latency_us: i64 = @intCast(@divTrunc(latency_ns, 1000));
+    var buf: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "{{\"ts\":{d},\"ev\":\"access\",\"tool\":\"{s}\",\"path\":\"{s}\",\"latency_us\":{d}}}\n", .{
+        std.time.milliTimestamp(), tool, escaped[0..elen], latency_us,
+    }) catch return;
+    appendToWal(line);
+}
+fn globMatch(pattern: []const u8, path: []const u8) bool {
+    var pi: usize = 0;
+    var gi: usize = 0;
+    var star_g: ?usize = null;
+    var star_p: usize = 0;
+
+    while (pi < path.len) {
+        if (gi < pattern.len and (pattern[gi] == path[pi] or (pattern[gi] == '?' and path[pi] != '/'))) {
+            gi += 1;
+            pi += 1;
+        } else if (gi < pattern.len and pattern[gi] == '*') {
+            // Check for ** (matches across path separators)
+            if (gi + 1 < pattern.len and pattern[gi + 1] == '*') {
+                // ** matches everything including /
+                star_g = gi;
+                star_p = pi;
+                gi += 2;
+                if (gi < pattern.len and pattern[gi] == '/') gi += 1; // skip trailing /
+            } else {
+                // * matches everything except /
+                star_g = gi;
+                star_p = pi;
+                gi += 1;
+            }
+        } else if (star_g != null) {
+            gi = star_g.? + 1;
+            if (gi < pattern.len and pattern[gi - 1] == '*' and pattern[gi] == '*') {
+                gi += 1;
+                if (gi < pattern.len and pattern[gi] == '/') gi += 1;
+            }
+            star_p += 1;
+            pi = star_p;
+            // Single * must not cross /
+            if (pattern[star_g.?] == '*' and (star_g.? + 1 >= pattern.len or pattern[star_g.? + 1] != '*')) {
+                if (pi > 0 and path[pi - 1] == '/') return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    while (gi < pattern.len and pattern[gi] == '*') : (gi += 1) {}
+    return gi == pattern.len;
 }
 
 pub fn isPathSafe(path: []const u8) bool {

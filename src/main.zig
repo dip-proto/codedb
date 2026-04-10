@@ -9,6 +9,9 @@ const mcp_server = @import("mcp.zig");
 const sty = @import("style.zig");
 const git_mod = @import("git.zig");
 const TrigramIndex = @import("index.zig").TrigramIndex;
+const MmapTrigramIndex = @import("index.zig").MmapTrigramIndex;
+const AnyTrigramIndex = @import("index.zig").AnyTrigramIndex;
+const WordIndex = @import("index.zig").WordIndex;
 const index_mod = @import("index.zig");
 const snapshot_mod = @import("snapshot.zig");
 const telemetry = @import("telemetry.zig");
@@ -88,7 +91,7 @@ fn mainImpl() !void {
 
     // Handle --version early (no root needed)
     if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v") or std.mem.eql(u8, cmd, "version")) {
-        out.p("codedb 0.2.53\n", .{});
+        out.p("codedb 0.2.56\n", .{});
         return;
     }
 
@@ -98,11 +101,38 @@ fn mainImpl() !void {
         return;
     }
 
-    // Handle update command (re-runs the install script)
+    // Handle update command — direct binary download from GitHub releases.
+    // The CDN install script has issues with set -euo pipefail on macOS,
+    // so we download the binary directly and replace in-place.
     if (std.mem.eql(u8, cmd, "update")) {
         out.p("updating codedb...\n", .{});
         var child = std.process.Child.init(
-            &.{ "/bin/bash", "-c", "curl -fsSL https://codedb.codegraff.com/install.sh | bash" },
+            &.{ "/bin/bash", "-c",
+                \\set -e
+                \\PLATFORM="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
+                \\case "$PLATFORM" in
+                \\  darwin-arm64) BIN="codedb-darwin-arm64" ;;
+                \\  darwin-x86_64) BIN="codedb-darwin-x86_64" ;;
+                \\  linux-x86_64) BIN="codedb-linux-x86_64" ;;
+                \\  linux-aarch64) BIN="codedb-linux-aarch64" ;;
+                \\  *) echo "unsupported platform: $PLATFORM" >&2; exit 1 ;;
+                \\esac
+                \\VERSION=$(curl -fsSL https://api.github.com/repos/justrach/codedb/releases/latest 2>/dev/null | grep -oE '"tag_name"\s*:\s*"v[^"]*"' | cut -d'"' -f4 | sed 's/^v//')
+                \\if [ -z "$VERSION" ]; then
+                \\  VERSION=$(curl -fsSL https://codedb.codegraff.com/latest.json | grep -oE '"version"\s*:\s*"[^"]*"' | cut -d'"' -f4)
+                \\fi
+                \\if [ -z "$VERSION" ]; then
+                \\  echo "failed to determine latest version" >&2
+                \\  exit 1
+                \\fi
+                \\echo "  latest: v${VERSION}"
+                \\TMP=$(mktemp)
+                \\curl -fsSL "https://github.com/justrach/codedb/releases/download/v${VERSION}/${BIN}" -o "$TMP"
+                \\SELF=$(which codedb 2>/dev/null || echo "$HOME/bin/codedb")
+                \\chmod +x "$TMP"
+                \\mv -f "$TMP" "$SELF"
+                \\echo "  updated: $($SELF --version)"
+            },
             allocator,
         );
         child.stdin_behavior = .Inherit;
@@ -112,6 +142,96 @@ fn mainImpl() !void {
             out.p("update failed\n", .{});
             std.process.exit(1);
         };
+        return;
+    }
+
+    // Handle nuke command early — before root resolution so it works from anywhere
+    if (std.mem.eql(u8, cmd, "nuke")) {
+        const home = std.process.getEnvVarOwned(allocator, "HOME") catch {
+            out.p("{s}\xe2\x9c\x97{s} cannot determine HOME directory\n", .{ s.red, s.reset });
+            std.process.exit(1);
+        };
+        defer allocator.free(home);
+
+        // Kill other running codedb processes (exclude ourselves)
+        const my_pid = std.Thread.getCurrentId();
+        var pid_buf: [32]u8 = undefined;
+        const my_pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{my_pid}) catch "0";
+
+        const pgrep_result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "pgrep", "-f", "codedb.*(serve|mcp)" },
+            .max_output_bytes = 4096,
+        }) catch null;
+        if (pgrep_result) |pr| {
+            defer allocator.free(pr.stdout);
+            defer allocator.free(pr.stderr);
+            var line_iter = std.mem.splitScalar(u8, pr.stdout, '\n');
+            while (line_iter.next()) |pid_line| {
+                const trimmed = std.mem.trim(u8, pid_line, " \t\r\n");
+                if (trimmed.len == 0) continue;
+                if (std.mem.eql(u8, trimmed, my_pid_str)) continue;
+                const kill_r = std.process.Child.run(.{
+                    .allocator = allocator,
+                    .argv = &.{ "kill", trimmed },
+                    .max_output_bytes = 256,
+                }) catch null;
+                if (kill_r) |kr| {
+                    allocator.free(kr.stdout);
+                    allocator.free(kr.stderr);
+                }
+            }
+        }
+
+        // Remove ~/.codedb/
+        const codedb_dir = std.fmt.allocPrint(allocator, "{s}/.codedb", .{home}) catch {
+            std.process.exit(1);
+        };
+        defer allocator.free(codedb_dir);
+
+        // Read all project roots from ~/.codedb/projects/*/project.txt
+        // before deleting the data dir, so we can clean their snapshots
+        var snapshot_count: usize = 0;
+        const projects_dir = std.fmt.allocPrint(allocator, "{s}/.codedb/projects", .{home}) catch null;
+        if (projects_dir) |pd| {
+            defer allocator.free(pd);
+            var dir = std.fs.cwd().openDir(pd, .{ .iterate = true }) catch null;
+            if (dir) |*d| {
+                defer d.close();
+                var iter = d.iterate();
+                while (iter.next() catch null) |entry| {
+                    if (entry.kind != .directory) continue;
+                    // Read project.txt to get the project root path
+                    const proj_file = std.fmt.allocPrint(allocator, "{s}/{s}/project.txt", .{ pd, entry.name }) catch continue;
+                    defer allocator.free(proj_file);
+                    const proj_root = std.fs.cwd().readFileAlloc(allocator, proj_file, 4096) catch continue;
+                    defer allocator.free(proj_root);
+                    const trimmed_root = std.mem.trim(u8, proj_root, " \t\r\n");
+                    if (trimmed_root.len == 0) continue;
+                    // Delete codedb.snapshot in that project root
+                    const snap = std.fmt.allocPrint(allocator, "{s}/codedb.snapshot", .{trimmed_root}) catch continue;
+                    defer allocator.free(snap);
+                    std.fs.cwd().deleteFile(snap) catch continue;
+                    snapshot_count += 1;
+                }
+            }
+        }
+
+        // Also try cwd snapshot (in case project wasn't registered)
+        std.fs.cwd().deleteFile("codedb.snapshot") catch {};
+
+        // Now remove ~/.codedb/
+        std.fs.cwd().deleteTree(codedb_dir) catch |err| {
+            if (err != error.FileNotFound) {
+                out.p("{s}\xe2\x9c\x97{s} failed to remove {s}: {}\n", .{ s.red, s.reset, codedb_dir, err });
+            }
+        };
+
+        out.p("{s}\xe2\x9c\x93{s} nuked all codedb data\n", .{ s.green, s.reset });
+        out.p("  removed {s}{s}{s}\n", .{ s.dim, codedb_dir, s.reset });
+        out.p("  removed {d} project snapshot(s)\n", .{snapshot_count});
+        out.p("  killed running codedb processes\n", .{});
+        out.p("\n  to reinstall: {s}curl -fsSL https://codedb.codegraff.com/install.sh | bash{s}\n", .{ s.cyan, s.reset });
         return;
     }
 
@@ -163,6 +283,7 @@ fn mainImpl() !void {
 
         // Try loading from codedb.snapshot if it exists and git HEAD matches.
         const snapshot_path = "codedb.snapshot";
+        const snapshot_t0 = std.time.nanoTimestamp();
         const snapshot_loaded = blk: {
             const snap_head = snapshot_mod.readSnapshotGitHead(snapshot_path) orelse {
                 // No git HEAD in snapshot (non-git project or missing) — load if current project also has no git
@@ -173,17 +294,21 @@ fn mainImpl() !void {
             if (!std.mem.eql(u8, &snap_head, &cur_head)) break :blk false;
             break :blk snapshot_mod.loadSnapshot(snapshot_path, &explorer, &store, allocator);
         };
+        const snapshot_elapsed = std.time.nanoTimestamp() - snapshot_t0;
 
         if (snapshot_loaded) {
-            const t_scan = std.time.nanoTimestamp();
+            if (std.mem.eql(u8, cmd, "search")) {
+                loadTrigramFromDiskIfPresent(&explorer, data_dir, allocator);
+            } else if (std.mem.eql(u8, cmd, "word")) {
+                loadWordIndexFromDiskIfPresent(&explorer, data_dir, git_head, allocator);
+            }
             var dur_buf: [64]u8 = undefined;
-            const scan_elapsed = std.time.nanoTimestamp() - t_scan;
             out.p("{s}\xe2\x9c\x93{s} {s}loaded snapshot{s}  {s}{d} files{s}  {s}{s}{s}\n", .{
-                s.green,                                    s.reset,
-                s.bold,                                     s.reset,
-                s.dim,                                      explorer.outlines.count(),
-                s.reset,                                    sty.durationColor(s, scan_elapsed),
-                sty.formatDuration(&dur_buf, scan_elapsed), s.reset,
+                s.green,                                        s.reset,
+                s.bold,                                         s.reset,
+                s.dim,                                          explorer.outlines.count(),
+                s.reset,                                        sty.durationColor(s, snapshot_elapsed),
+                sty.formatDuration(&dur_buf, snapshot_elapsed), s.reset,
             });
         } else {
             const disk_hdr = TrigramIndex.readDiskHeader(data_dir, allocator) catch null;
@@ -210,13 +335,18 @@ fn mainImpl() !void {
             });
 
             if (heads_match) {
-                // Verify file count then load trigram from disk
-                const current_count = @as(u16, @intCast(@min(explorer.outlines.count(), std.math.maxInt(u16))));
+                // Verify file count then load trigram from disk via mmap
+                const current_count = @as(u32, @intCast(explorer.outlines.count()));
                 if (disk_hdr != null and current_count == disk_hdr.?.file_count) {
-                    if (TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
+                    if (MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
                         explorer.mu.lock();
                         explorer.trigram_index.deinit();
-                        explorer.trigram_index = loaded;
+                        explorer.trigram_index = .{ .mmap = loaded };
+                        explorer.mu.unlock();
+                    } else if (TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
+                        explorer.mu.lock();
+                        explorer.trigram_index.deinit();
+                        explorer.trigram_index = .{ .heap = loaded };
                         explorer.mu.unlock();
                     } else {
                         explorer.rebuildTrigrams() catch {};
@@ -449,6 +579,15 @@ fn mainImpl() !void {
             out.p("{s}\xe2\x9c\x97{s} snapshot failed: {}\n", .{ s.red, s.reset, err });
             std.process.exit(1);
         };
+        const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
+        loadWordIndexFromDiskIfPresent(&explorer, data_dir, git_head, allocator);
+        if (!explorer.wordIndexIsComplete()) {
+            explorer.rebuildWordIndex() catch |err| {
+                out.p("{s}\xe2\x9c\x97{s} word index rebuild failed: {}\n", .{ s.red, s.reset, err });
+                std.process.exit(1);
+            };
+        }
+        persistWordIndexToDisk(&explorer, data_dir, git_head);
         const elapsed = std.time.nanoTimestamp() - t0;
         var dur_buf: [64]u8 = undefined;
         out.p("{s}\xe2\x9c\x93{s} {s}snapshot{s}  {s}{s}{s}  {s}{d} files{s}  {s}{s}{s}\n", .{
@@ -488,7 +627,12 @@ fn mainImpl() !void {
 
         saveProjectInfo(allocator, data_dir, abs_root) catch {};
 
+        // Set up query tracking WAL
+        const query_log = std.fmt.allocPrint(allocator, "{s}/queries.log", .{data_dir}) catch null;
+        if (query_log) |ql| mcp_server.setQueryLogPath(ql);
+
         const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
+        const startup_t0 = std.time.milliTimestamp();
         const snapshot_loaded = blk: {
             const snap_head = snapshot_mod.readSnapshotGitHead("codedb.snapshot") orelse {
                 if (git_head != null) break :blk false;
@@ -517,11 +661,11 @@ fn mainImpl() !void {
         defer allocator.destroy(queue);
         queue.* = watcher.EventQueue{};
         var scan_thread: ?std.Thread = null;
-        const startup_t0 = std.time.milliTimestamp();
         if (!snapshot_loaded) {
-            scan_thread = try std.Thread.spawn(.{}, scanBg, .{ &store, &explorer, root, allocator, &scan_done, data_dir, abs_root, &telem, startup_t0 });
+            scan_thread = try std.Thread.spawn(.{}, scanBg, .{ &store, &explorer, root, allocator, &scan_done, &shutdown, data_dir, abs_root, &telem, startup_t0 });
         } else {
             const startup_time_ms: u64 = @intCast(@max(std.time.milliTimestamp() - startup_t0, 0));
+            loadTrigramFromDiskIfPresent(&explorer, data_dir, allocator);
             telem.recordCodebaseStats(&explorer, startup_time_ms);
         }
 
@@ -532,11 +676,13 @@ fn mainImpl() !void {
 
         mcp_server.run(allocator, &store, &explorer, &agents, abs_root, &telem);
 
+        // Sync WAL profiling data to cloud before shutdown
+        telem.syncWalToCloud(if (query_log) |ql| ql else null);
+
         shutdown.store(true, .release);
         if (scan_thread) |st| st.join();
         watch_thread.join();
         idle_thread.join();
-        if (scan_thread) |t| t.join();
     } else {
         out.p("{s}\xe2\x9c\x97{s} unknown command: {s}{s}{s}\n", .{
             s.red, s.reset, s.bold, cmd, s.reset,
@@ -545,7 +691,7 @@ fn mainImpl() !void {
     }
 }
 fn isCommand(arg: []const u8) bool {
-    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "hot", "snapshot", "serve", "mcp", "update" };
+    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "hot", "snapshot", "serve", "mcp", "update", "nuke" };
     for (commands) |c| {
         if (std.mem.eql(u8, arg, c)) return true;
     }
@@ -572,6 +718,76 @@ fn getDataDir(allocator: std.mem.Allocator, abs_root: []const u8) ![]u8 {
     return dir;
 }
 
+fn loadTrigramFromDiskIfPresent(explorer: *Explorer, data_dir: []const u8, allocator: std.mem.Allocator) void {
+    explorer.mu.lockShared();
+    const already_loaded = explorer.trigram_index.fileCount() > 0;
+    explorer.mu.unlockShared();
+    if (already_loaded) return;
+
+    if (MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
+        explorer.mu.lock();
+        defer explorer.mu.unlock();
+        explorer.trigram_index.deinit();
+        explorer.trigram_index = .{ .mmap = loaded };
+    } else if (TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
+        explorer.mu.lock();
+        defer explorer.mu.unlock();
+        explorer.trigram_index.deinit();
+        explorer.trigram_index = .{ .heap = loaded };
+    }
+}
+
+fn loadWordIndexFromDiskIfPresent(
+    explorer: *Explorer,
+    data_dir: []const u8,
+    current_git_head: ?[40]u8,
+    allocator: std.mem.Allocator,
+) void {
+    if (!explorer.wordIndexCanLoadFromDisk()) return;
+
+    const header = WordIndex.readDiskHeader(data_dir, allocator) catch null orelse {
+        explorer.disableWordIndexDiskLoad();
+        return;
+    };
+
+    explorer.mu.lockShared();
+    const current_count = @as(u32, @intCast(explorer.outlines.count()));
+    explorer.mu.unlockShared();
+    if (header.file_count != current_count) {
+        explorer.disableWordIndexDiskLoad();
+        return;
+    }
+
+    const heads_match = blk: {
+        if (current_git_head == null and header.git_head == null) break :blk true;
+        if (current_git_head == null or header.git_head == null) break :blk false;
+        break :blk std.mem.eql(u8, &current_git_head.?, &header.git_head.?);
+    };
+    if (!heads_match) {
+        explorer.disableWordIndexDiskLoad();
+        return;
+    }
+
+    if (WordIndex.readFromDisk(data_dir, allocator)) |loaded| {
+        explorer.replaceWordIndex(loaded);
+    } else {
+        explorer.disableWordIndexDiskLoad();
+    }
+}
+
+fn persistWordIndexToDisk(explorer: *Explorer, data_dir: []const u8, git_head: ?[40]u8) void {
+    const generation = explorer.wordIndexGenerationToPersist() orelse return;
+
+    explorer.mu.lockShared();
+    explorer.word_index.writeToDisk(data_dir, git_head) catch |err| {
+        explorer.mu.unlockShared();
+        std.log.warn("could not persist word index: {}", .{err});
+        return;
+    };
+    explorer.mu.unlockShared();
+    explorer.markWordIndexPersisted(generation);
+}
+
 fn saveProjectInfo(allocator: std.mem.Allocator, data_dir: []const u8, abs_root: []const u8) !void {
     const info_path = try std.fmt.allocPrint(allocator, "{s}/project.txt", .{data_dir});
     defer allocator.free(info_path);
@@ -596,6 +812,7 @@ fn printUsage(out: Out, s: sty.Style) void {
         \\    {s}hot{s}                       recently modified files
         \\    {s}serve{s}                     HTTP daemon on :7719
         \\    {s}mcp{s}                       JSON-RPC/MCP server over stdio
+        \\    {s}nuke{s}                      remove all codedb data, snapshots, and kill processes
         \\
     , .{
         s.bold, s.reset,
@@ -610,6 +827,7 @@ fn printUsage(out: Out, s: sty.Style) void {
         s.dim,  s.reset,
         s.cyan, s.reset,
         s.dim,  s.reset,
+        s.cyan, s.reset,
         s.cyan, s.reset,
         s.cyan, s.reset,
         s.cyan, s.reset,
@@ -631,12 +849,16 @@ fn printUsage(out: Out, s: sty.Style) void {
 
 fn reapLoop(agents: *AgentRegistry, shutdown: *std.atomic.Value(bool)) void {
     while (!shutdown.load(.acquire)) {
-        std.Thread.sleep(5 * std.time.ns_per_s);
+        // Sleep in 1s increments for responsive shutdown (was 5s)
+        for (0..5) |_| {
+            if (shutdown.load(.acquire)) return;
+            std.Thread.sleep(std.time.ns_per_s);
+        }
         agents.reapStale(30_000);
     }
 }
 
-fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.mem.Allocator, scan_done: *std.atomic.Value(bool), data_dir: []const u8, abs_root: []const u8, telem: *telemetry.Telemetry, startup_t0: i64) void {
+fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.mem.Allocator, scan_done: *std.atomic.Value(bool), shutdown: *std.atomic.Value(bool), data_dir: []const u8, abs_root: []const u8, telem: *telemetry.Telemetry, startup_t0: i64) void {
     const git_head = git_mod.getGitHead(root, allocator) catch null;
     const disk_hdr = TrigramIndex.readDiskHeader(data_dir, allocator) catch null;
     const heads_match = blk: {
@@ -649,18 +871,42 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
         std.log.warn("background scan failed: {}", .{err});
     };
 
+    // Phase gate: bail if shutting down after initial scan
+    if (shutdown.load(.acquire)) {
+        scan_done.store(true, .release);
+        return;
+    }
+    persistWordIndexToDisk(explorer, data_dir, git_head);
+
     if (heads_match) {
-        // Verify file count, then load trigram index from disk (skip rebuild)
-        const current_count = @as(u16, @intCast(@min(explorer.outlines.count(), std.math.maxInt(u16))));
+        const current_count = @as(u32, @intCast(explorer.outlines.count()));
         if (disk_hdr != null and current_count == disk_hdr.?.file_count) {
+            if (MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
+                explorer.mu.lock();
+                explorer.trigram_index.deinit();
+                explorer.trigram_index = .{ .mmap = loaded };
+                explorer.mu.unlock();
+                scan_done.store(true, .release);
+                if (shutdown.load(.acquire)) return;
+                telem.recordCodebaseStats(explorer, @intCast(@max(std.time.milliTimestamp() - startup_t0, 0)));
+                snapshot_mod.writeSnapshotDual(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
+                    std.log.warn("could not auto-write snapshot: {}", .{err});
+                };
+                const fc = explorer.outlines.count();
+                if (fc > 1000 or std.process.hasEnvVarConstant("CODEDB_LOW_MEMORY")) {
+                    explorer.releaseContents();
+                    explorer.releaseSecondaryIndexes();
+                }
+                return;
+            }
             if (TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
                 explorer.mu.lock();
                 explorer.trigram_index.deinit();
-                explorer.trigram_index = loaded;
+                explorer.trigram_index = .{ .heap = loaded };
                 explorer.mu.unlock();
                 scan_done.store(true, .release);
+                if (shutdown.load(.acquire)) return;
                 telem.recordCodebaseStats(explorer, @intCast(@max(std.time.milliTimestamp() - startup_t0, 0)));
-                // Auto-write snapshot after successful scan
                 snapshot_mod.writeSnapshotDual(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
                     std.log.warn("could not auto-write snapshot: {}", .{err});
                 };
@@ -672,31 +918,47 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
                 return;
             }
         }
-        // File count mismatch or disk read failed — rebuild trigrams from stored content
         explorer.rebuildTrigrams() catch {};
+    }
+
+    // Phase gate: bail before disk write if shutting down
+    if (shutdown.load(.acquire)) {
+        scan_done.store(true, .release);
+        return;
     }
 
     explorer.trigram_index.writeToDisk(data_dir, git_head) catch |err| {
         std.log.warn("could not persist trigram index: {}", .{err});
     };
 
-    // Compact: free the scan-time trigram (fragmented) and reload from disk (dense).
-    // This reclaims allocator fragmentation from incremental index building.
-    if (TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
+    // Phase gate: bail before mmap swap if shutting down
+    if (shutdown.load(.acquire)) {
+        scan_done.store(true, .release);
+        return;
+    }
+
+    // Compact: swap heap index for mmap — zero RSS, data lives in OS page cache.
+    if (MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
         explorer.mu.lock();
         explorer.trigram_index.deinit();
-        explorer.trigram_index = loaded;
+        explorer.trigram_index = .{ .mmap = loaded };
+        explorer.mu.unlock();
+    } else if (TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
+        explorer.mu.lock();
+        explorer.trigram_index.deinit();
+        explorer.trigram_index = .{ .heap = loaded };
         explorer.mu.unlock();
     }
 
     scan_done.store(true, .release);
+
+    if (shutdown.load(.acquire)) return;
+
     telem.recordCodebaseStats(explorer, @intCast(@max(std.time.milliTimestamp() - startup_t0, 0)));
 
     snapshot_mod.writeSnapshotDual(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
         std.log.warn("could not auto-write snapshot: {}", .{err});
     };
-    // Only release contents for large repos where memory savings matter.
-    // Small repos keep content in RAM for faster search.
     const file_count = explorer.outlines.count();
     if (file_count > 1000 or std.process.hasEnvVarConstant("CODEDB_LOW_MEMORY")) {
         explorer.releaseContents();
@@ -706,17 +968,19 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
 fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
     const mcp = @import("mcp.zig");
     while (!shutdown.load(.acquire)) {
-        std.Thread.sleep(10 * std.time.ns_per_s); // check every 10s instead of 30s
+        // Sleep in 1s increments for responsive shutdown
+        for (0..10) |_| {
+            if (shutdown.load(.acquire)) return;
+            std.Thread.sleep(std.time.ns_per_s);
+        }
 
-        // Quick liveness check: try a zero-byte read on stdin
-        // If the pipe is broken (client gone), this returns immediately
+        // Quick liveness check: poll stdin for POLLHUP (client disconnected)
         const stdin = std.fs.File.stdin();
         var poll_fds = [_]std.posix.pollfd{.{
             .fd = stdin.handle,
             .events = std.posix.POLL.IN | std.posix.POLL.HUP,
             .revents = 0,
         }};
-        // Non-blocking poll with 0 timeout
         const poll_result = std.posix.poll(&poll_fds, 0) catch 0;
         if (poll_result > 0 and (poll_fds[0].revents & std.posix.POLL.HUP) != 0) {
             std.log.info("stdin closed (client disconnected), exiting", .{});
