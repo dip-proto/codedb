@@ -235,7 +235,7 @@ pub fn deregisterJsonIntegrationFile(allocator: std.mem.Allocator, path: []const
 
     const rewritten = try removeJsonMcpServerEntry(allocator, content, "codedb") orelse return false;
     defer allocator.free(rewritten);
-    try rewriteConfigFile(path, rewritten);
+    try rewriteConfigFile(allocator, path, rewritten);
     return true;
 }
 
@@ -245,11 +245,11 @@ pub fn deregisterCodexIntegrationFile(allocator: std.mem.Allocator, path: []cons
 
     const rewritten = try removeCodexMcpServerBlock(allocator, content, "codedb") orelse return false;
     defer allocator.free(rewritten);
-    try rewriteConfigFile(path, rewritten);
+    try rewriteConfigFile(allocator, path, rewritten);
     return true;
 }
 
-fn rewriteConfigFile(path: []const u8, content: []const u8) !void {
+fn rewriteConfigFile(allocator: std.mem.Allocator, path: []const u8, content: []const u8) !void {
     if (std.mem.trim(u8, content, " \t\r\n").len == 0) {
         std.fs.cwd().deleteFile(path) catch |err| switch (err) {
             error.FileNotFound => {},
@@ -258,9 +258,16 @@ fn rewriteConfigFile(path: []const u8, content: []const u8) !void {
         return;
     }
 
-    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(content);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+    errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        defer file.close();
+        try file.writeAll(content);
+        try file.sync();
+    }
+    try std.fs.rename(std.fs.cwd(), tmp_path, std.fs.cwd(), path);
 }
 
 pub fn removeJsonMcpServerEntry(allocator: std.mem.Allocator, content: []const u8, server_name: []const u8) !?[]u8 {

@@ -1681,7 +1681,10 @@ pub const AnyTrigramIndex = union(enum) {
                 result.ensureTotalCapacity(allocator, merged.count()) catch break :blk null;
                 var it = merged.keyIterator();
                 while (it.next()) |k| result.appendAssumeCapacity(k.*);
-                break :blk result.toOwnedSlice(allocator) catch null;
+                break :blk result.toOwnedSlice(allocator) catch {
+                    result.deinit(allocator);
+                    break :blk null;
+                };
             },
         };
     }
@@ -1714,7 +1717,10 @@ pub const AnyTrigramIndex = union(enum) {
                 result.ensureTotalCapacity(allocator, merged.count()) catch break :blk null;
                 var it = merged.keyIterator();
                 while (it.next()) |k| result.appendAssumeCapacity(k.*);
-                break :blk result.toOwnedSlice(allocator) catch null;
+                break :blk result.toOwnedSlice(allocator) catch {
+                    result.deinit(allocator);
+                    break :blk null;
+                };
             },
         };
     }
