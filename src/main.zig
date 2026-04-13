@@ -212,6 +212,12 @@ fn mainImpl() !void {
             }
 
             const t_scan = std.time.nanoTimestamp();
+            // Use page_allocator for word index during scan — freed pages
+            // return to OS immediately instead of c_allocator retention.
+            explorer.mu.lock();
+            explorer.word_index.deinit();
+            explorer.word_index = WordIndex.init(std.heap.c_allocator);
+            explorer.mu.unlock();
             // Skip file_words tracking during bulk scan — saves ~450MB.
             // Only needed for removeFile (incremental re-indexing), not initial scan.
             explorer.word_index.skip_file_words = true;
