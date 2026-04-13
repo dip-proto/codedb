@@ -212,6 +212,9 @@ fn mainImpl() !void {
             }
 
             const t_scan = std.time.nanoTimestamp();
+            // Skip file_words tracking during bulk scan — saves ~450MB.
+            // Only needed for removeFile (incremental re-indexing), not initial scan.
+            explorer.word_index.skip_file_words = true;
             // Always skip trigrams during scan — build them after to halve peak RSS.
             // Trigrams are either loaded from disk (warm) or rebuilt file-by-file (cold).
             try watcher.initialScan(&store, &explorer, root, allocator, true);
@@ -260,10 +263,9 @@ fn mainImpl() !void {
                 explorer.word_index = WordIndex.init(allocator);
                 explorer.mu.unlock();
                 {
-                    // Build trigrams into a temporary index backed by page_allocator.
-                    // When the arena is freed, ALL trigram pages go back to OS.
-                    var tri_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-                    var tmp_tri = TrigramIndex.init(tri_arena.allocator());
+                    // Build trigrams with c_allocator — freed pages returned to OS
+                    // on HashMap resize (unlike ArenaAllocator which retains all).
+                    var tmp_tri = TrigramIndex.init(std.heap.c_allocator);
 
                     var tri_dir = std.fs.cwd().openDir(root, .{}) catch null;
                     defer if (tri_dir) |*d| d.close();
@@ -285,8 +287,8 @@ fn mainImpl() !void {
                     tmp_tri.writeToDisk(data_dir, git_head) catch |err| {
                         std.log.warn("could not persist trigram index: {}", .{err});
                     };
-                    // Free temp trigram — arena.deinit returns all pages to OS
-                    tri_arena.deinit();
+                    // Free temp trigram — c_allocator returns pages to OS
+                    tmp_tri.deinit();
                 }
                 // Load trigrams as mmap (zero heap cost)
                 if (MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {

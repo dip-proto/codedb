@@ -16,6 +16,7 @@ pub const WordIndex = struct {
     /// WordIndex owns these path keys.
     file_words: std.StringHashMap([]const []const u8),
     allocator: std.mem.Allocator,
+    skip_file_words: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) WordIndex {
         return .{
@@ -133,16 +134,17 @@ pub const WordIndex = struct {
             }
         }
 
-        // Compact the HashMap to a simple slice — saves ~70KB per file
-        // (HashMap buckets are ~68KB for 2000 words; slice is ~32KB)
-        const compact = try self.allocator.alloc([]const u8, words_set.count());
-        var ki: usize = 0;
-        var wk_iter = words_set.keyIterator();
-        while (wk_iter.next()) |k| : (ki += 1) {
-            compact[ki] = k.*;
+        if (!self.skip_file_words) {
+            // Compact the HashMap to a simple slice — saves ~70KB per file
+            const compact = try self.allocator.alloc([]const u8, words_set.count());
+            var ki: usize = 0;
+            var wk_iter = words_set.keyIterator();
+            while (wk_iter.next()) |k| : (ki += 1) {
+                compact[ki] = k.*;
+            }
+            try self.file_words.put(stable_path, compact);
         }
         words_set.deinit();
-        try self.file_words.put(stable_path, compact);
     }
 
     /// Look up all hits for a word. O(1) lookup + O(hits) iteration.
