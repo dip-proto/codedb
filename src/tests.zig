@@ -5765,3 +5765,99 @@ test "issue-250: searchContent finds content in files skipped by trigram index" 
     }
     try testing.expectEqual(@as(usize, 1), results.len);
 }
+
+test "snapshot: symbol detail longer than 4096 bytes survives round-trip" {
+    // Regression for readSectionString rejecting names/details > 4096 bytes.
+    // Before the fix max_len was 4096; any detail longer than that triggered
+    // error.InvalidData and loadSnapshot returned false.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Build a Zig source whose first function line exceeds 4 096 characters.
+    var src: std.ArrayList(u8) = .{};
+    defer src.deinit(testing.allocator);
+    try src.appendSlice(testing.allocator, "pub fn bigSig(");
+    var param_i: usize = 0;
+    while (src.items.len < 5000) : (param_i += 1) {
+        var pb: [20]u8 = undefined;
+        const ps = std.fmt.bufPrint(&pb, "p{d}: u8, ", .{param_i}) catch break;
+        try src.appendSlice(testing.allocator, ps);
+    }
+    try src.appendSlice(testing.allocator, ") void {}\n");
+    try testing.expect(src.items.len > 4096); // guard: ensure we actually generated a long line
+    var exp = Explorer.init(aa);
+    try exp.indexFile("src/big.zig", src.items);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/big.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(&exp, dir_path, snap_path, testing.allocator);
+
+    var exp2 = Explorer.init(testing.allocator);
+    defer exp2.deinit();
+    var store2 = Store.init(testing.allocator);
+    defer store2.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(snap_path, &exp2, &store2, testing.allocator);
+    try testing.expect(loaded); // must survive long detail
+
+    var sym_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer sym_arena.deinit();
+    const results = try exp2.findAllSymbols("bigSig", sym_arena.allocator());
+    try testing.expect(results.len >= 1);
+}
+
+test "snapshot: corrupted OUTLINE_STATE section falls back to CONTENT load" {
+    // Regression for the codedb 0.2.56 writer u16 overflow bug: when OUTLINE_STATE
+    // contains a detail that overflows u16 the section cursor de-syncs, making
+    // subsequent file records parse as garbage and loadOutlineStateMap throws.
+    // The catch fallback must produce an empty map so loadSnapshotFast falls
+    // through to indexFileOutlineOnly for every file in CONTENT.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa);
+    try exp.indexFile("src/a.zig", "pub fn aFunc() void {}\n");
+    try exp.indexFile("src/b.zig", "pub fn bFunc() void {}\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/corrupt.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(&exp, dir_path, snap_path, testing.allocator);
+
+    // Overwrite the first 16 bytes of OUTLINE_STATE data with 0xFF.
+    // This makes the file_count field read as 0xFFFFFFFF — far more records
+    // than the data contains — causing readSectionString to eventually fail
+    // with error.InvalidData (runs off the end of the bytes slice).
+    {
+        var sections = (try snapshot_mod.readSections(snap_path, testing.allocator)).?;
+        defer sections.deinit();
+        const ols = sections.get(@intFromEnum(snapshot_mod.SectionId.outline_state)) orelse return;
+        const f = try std.fs.cwd().openFile(snap_path, .{ .mode = .read_write });
+        defer f.close();
+        try f.seekTo(ols.offset);
+        try f.writeAll(&([_]u8{0xFF} ** 16));
+    }
+
+    var exp2 = Explorer.init(testing.allocator);
+    defer exp2.deinit();
+    var store2 = Store.init(testing.allocator);
+    defer store2.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(snap_path, &exp2, &store2, testing.allocator);
+    try testing.expect(loaded); // must survive OUTLINE_STATE corruption
+
+    // Symbols must still be found — re-indexed from CONTENT
+    var sym_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer sym_arena.deinit();
+    const results = try exp2.findAllSymbols("aFunc", sym_arena.allocator());
+    try testing.expect(results.len >= 1);
+}
