@@ -14,13 +14,13 @@ pub const WordIndex = struct {
     index: std.StringHashMap(std.ArrayList(WordHit)),
     /// path → set of words contributed (for efficient re-index cleanup).
     /// WordIndex owns these path keys.
-    file_words: std.StringHashMap(std.StringHashMap(void)),
+    file_words: std.StringHashMap([]const []const u8),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) WordIndex {
         return .{
             .index = std.StringHashMap(std.ArrayList(WordHit)).init(allocator),
-            .file_words = std.StringHashMap(std.StringHashMap(void)).init(allocator),
+            .file_words = std.StringHashMap([]const []const u8).init(allocator),
             .allocator = allocator,
         };
     }
@@ -38,7 +38,7 @@ pub const WordIndex = struct {
         var fw_iter = self.file_words.iterator();
         while (fw_iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            self.allocator.free(entry.value_ptr.*);
         }
         self.file_words.deinit();
     }
@@ -47,16 +47,16 @@ pub const WordIndex = struct {
     pub fn removeFile(self: *WordIndex, path: []const u8) void {
         const removed = self.file_words.fetchRemove(path) orelse return;
         const stable_path = removed.key;
-        var words_set = removed.value;
+        const words_slice = removed.value;
         defer {
-            words_set.deinit();
+            self.allocator.free(words_slice);
             self.allocator.free(stable_path);
         }
 
         // For each word this file contributed, remove hits with this path.
         // Prune empty buckets so churn does not leak key/list entries.
-        var word_iter = words_set.keyIterator();
-        while (word_iter.next()) |word_ptr| {
+        for (words_slice) |word| {
+            const word_ptr = &word;
             if (self.index.getEntry(word_ptr.*)) |entry| {
                 const hits = entry.value_ptr;
                 var i: usize = 0;
@@ -85,8 +85,13 @@ pub const WordIndex = struct {
         const stable_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(stable_path);
 
-        var words_set = std.StringHashMap(void).init(self.allocator);
-        errdefer words_set.deinit();
+        // Use page_allocator-backed arena for words_set — pages are returned
+        // to the OS immediately when the arena is deinitialized, instead of
+        // being retained by the GPA (which caused ~1GB of page retention
+        // across 14K files of alloc/free churn).
+        var words_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer words_arena.deinit();
+        var words_set = std.StringHashMap(void).init(words_arena.allocator());
         var line_num: u32 = 0;
         var lines = std.mem.splitScalar(u8, content, '\n');
 
@@ -128,7 +133,16 @@ pub const WordIndex = struct {
             }
         }
 
-        try self.file_words.put(stable_path, words_set);
+        // Compact the HashMap to a simple slice — saves ~70KB per file
+        // (HashMap buckets are ~68KB for 2000 words; slice is ~32KB)
+        const compact = try self.allocator.alloc([]const u8, words_set.count());
+        var ki: usize = 0;
+        var wk_iter = words_set.keyIterator();
+        while (wk_iter.next()) |k| : (ki += 1) {
+            compact[ki] = k.*;
+        }
+        words_set.deinit();
+        try self.file_words.put(stable_path, compact);
     }
 
     /// Look up all hits for a word. O(1) lookup + O(hits) iteration.
@@ -323,6 +337,15 @@ pub const WordIndex = struct {
         var result = WordIndex.init(allocator);
         errdefer result.deinit();
 
+        // Temporary HashMap for accumulating file_words during load
+        // (compacted to slices below)
+        var tmp_file_words = std.StringHashMap(std.StringHashMap(void)).init(allocator);
+        defer {
+            var tfw_iter = tmp_file_words.iterator();
+            while (tfw_iter.next()) |entry| entry.value_ptr.deinit();
+            tmp_file_words.deinit();
+        }
+
         for (0..word_count) |_| {
             if (pos + 2 > data.len) return null;
             const word_len = std.mem.readInt(u16, data[pos..][0..2], .little);
@@ -356,7 +379,7 @@ pub const WordIndex = struct {
                 });
 
                 if (last_file_id == null or last_file_id.? != file_id) {
-                    const fw_gop = try result.file_words.getOrPut(stable_path);
+                    const fw_gop = try tmp_file_words.getOrPut(stable_path);
                     if (!fw_gop.found_existing) {
                         fw_gop.key_ptr.* = stable_path;
                         fw_gop.value_ptr.* = std.StringHashMap(void).init(allocator);
@@ -375,6 +398,19 @@ pub const WordIndex = struct {
         }
 
         if (pos != data.len) return null;
+
+        // Compact tmp_file_words HashMaps into slices for result.file_words
+        var tfw_iter = tmp_file_words.iterator();
+        while (tfw_iter.next()) |entry| {
+            const compact = try allocator.alloc([]const u8, entry.value_ptr.count());
+            var ki2: usize = 0;
+            var wk_iter2 = entry.value_ptr.keyIterator();
+            while (wk_iter2.next()) |k| : (ki2 += 1) {
+                compact[ki2] = k.*;
+            }
+            try result.file_words.put(entry.key_ptr.*, compact);
+        }
+
         return result;
     }
 

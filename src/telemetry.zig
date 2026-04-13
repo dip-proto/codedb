@@ -260,7 +260,7 @@ pub fn approxIndexSizeBytes(explorer: *const explore.Explorer) u64 {
 
     var file_words_iter = explorer.word_index.file_words.iterator();
     while (file_words_iter.next()) |entry| {
-        total +|= entry.value_ptr.count() * @sizeOf(usize);
+        total +|= entry.value_ptr.len * @sizeOf(usize);
     }
 
     switch (explorer.trigram_index) {
