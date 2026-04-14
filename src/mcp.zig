@@ -428,8 +428,11 @@ pub fn run(
     };
     defer session.deinit();
 
+    var read_buf: [4096]u8 = undefined;
+    var stdin_reader = stdin.reader(&read_buf);
+
     while (true) {
-        const msg = mcpj.readLine(alloc, stdin) orelse break;
+        const msg = mcpj.readLineBuf(alloc, &stdin_reader.interface) orelse break;
         last_activity.store(std.time.milliTimestamp(), .release);
         defer alloc.free(msg);
 
