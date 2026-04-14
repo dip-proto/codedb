@@ -995,76 +995,57 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
         const candidate_paths = self.trigram_index.candidates(query, allocator);
         defer if (candidate_paths) |cp| allocator.free(cp);
 
-        var searched = std.StringHashMap(void).init(allocator);
-        defer searched.deinit();
+        // Build unified candidate set: UNION of all index sources (#265).
+        // Previously sparse+trigram were intersected, dropping files that
+        // only appeared in one index.  Content verification in searchInContent
+        // already does exact matching, so false positives are harmless.
+        var all_candidates = std.StringHashMap(void).init(allocator);
+        defer all_candidates.deinit();
 
-        if (sparse_paths != null and sparse_paths.?.len > 0) {
-            if (candidate_paths != null and candidate_paths.?.len > 0) {
-                var sparse_set = std.StringHashMap(void).init(allocator);
-                defer sparse_set.deinit();
-                for (sparse_paths.?) |p| try sparse_set.put(p, {});
-                for (candidate_paths.?) |path| {
-                    if (!sparse_set.contains(path)) continue;
-                    const ref = self.readContentForSearch(path, allocator) orelse continue;
-                    defer ref.deinit();
-                    try searched.put(path, {});
-                    try searchInContent(path, ref.data, query, allocator, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
-                }
-            } else {
-                for (sparse_paths.?) |path| {
-                    const ref = self.readContentForSearch(path, allocator) orelse continue;
-                    defer ref.deinit();
-                    try searched.put(path, {});
-                    try searchInContent(path, ref.data, query, allocator, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
-                }
-            }
-        } else {
-            const use_trigram = candidate_paths != null and candidate_paths.?.len > 0;
-            if (use_trigram) {
-                for (candidate_paths.?) |path| {
-                    const ref = self.readContentForSearch(path, allocator) orelse continue;
-                    defer ref.deinit();
-                    try searched.put(path, {});
-                    try searchInContent(path, ref.data, query, allocator, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
-                }
-            } else {
-                // No trigram/sparse candidates — use word_index to narrow (#250)
-                const word_hits = self.word_index.search(query);
-                if (word_hits.len > 0) {
-                    var word_paths = std.StringHashMap(void).init(allocator);
-                    defer word_paths.deinit();
-                    for (word_hits) |hit| word_paths.put(self.word_index.hitPath(hit), {}) catch {};
-                    var wp_iter = word_paths.keyIterator();
-                    while (wp_iter.next()) |key_ptr| {
-                        const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
-                        defer ref.deinit();
-                        try searched.put(key_ptr.*, {});
-                        try searchInContent(key_ptr.*, ref.data, query, allocator, max_results, &result_list);
-                        if (result_list.items.len >= max_results) break;
-                    }
-                } else {
-                    var iter = self.outlines.keyIterator();
-                    while (iter.next()) |key_ptr| {
-                        const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
-                        defer ref.deinit();
-                        try searchInContent(key_ptr.*, ref.data, query, allocator, max_results, &result_list);
-                        if (result_list.items.len >= max_results) break;
-                    }
-                }
-            }
+        if (candidate_paths) |cp| for (cp) |p| all_candidates.put(p, {}) catch {};
+        if (sparse_paths) |sp| for (sp) |p| all_candidates.put(p, {}) catch {};
+
+        // Interleave skip_trigram_files instead of tail-block (#266).
+        {
+            var skip_iter = self.skip_trigram_files.keyIterator();
+            while (skip_iter.next()) |key_ptr| all_candidates.put(key_ptr.*, {}) catch {};
         }
 
-        if (result_list.items.len < max_results) {
-            var iter = self.skip_trigram_files.keyIterator();
+        const num_candidates = all_candidates.count();
+
+        if (num_candidates > 0) {
+            // Per-file cap prevents one file from dominating results (#267).
+            const max_per_file = @max(@as(usize, 1), max_results / @max(@as(usize, 1), num_candidates));
+
+            var iter = all_candidates.keyIterator();
             while (iter.next()) |key_ptr| {
-                if (searched.contains(key_ptr.*)) continue;
                 const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
                 defer ref.deinit();
-                try searchInContent(key_ptr.*, ref.data, query, allocator, max_results, &result_list);
+                try searchInContent(key_ptr.*, ref.data, query, allocator, max_per_file, max_results, &result_list);
                 if (result_list.items.len >= max_results) break;
+            }
+        } else {
+            // No trigram/sparse/skip_trigram candidates — use word_index to narrow (#250)
+            const word_hits = self.word_index.search(query);
+            if (word_hits.len > 0) {
+                var word_paths = std.StringHashMap(void).init(allocator);
+                defer word_paths.deinit();
+                for (word_hits) |hit| word_paths.put(self.word_index.hitPath(hit), {}) catch {};
+                var wp_iter = word_paths.keyIterator();
+                while (wp_iter.next()) |key_ptr| {
+                    const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
+                    defer ref.deinit();
+                    try searchInContent(key_ptr.*, ref.data, query, allocator, max_results, max_results, &result_list);
+                    if (result_list.items.len >= max_results) break;
+                }
+            } else {
+                var iter = self.outlines.keyIterator();
+                while (iter.next()) |key_ptr| {
+                    const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
+                    defer ref.deinit();
+                    try searchInContent(key_ptr.*, ref.data, query, allocator, max_results, max_results, &result_list);
+                    if (result_list.items.len >= max_results) break;
+                }
             }
         }
 
@@ -2348,8 +2329,9 @@ pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
     };
 }
 
-fn searchInContent(path: []const u8, content: []const u8, query: []const u8, allocator: std.mem.Allocator, max_results: usize, result_list: *std.ArrayList(SearchResult)) !void {
+fn searchInContent(path: []const u8, content: []const u8, query: []const u8, allocator: std.mem.Allocator, max_per_file: usize, max_results: usize, result_list: *std.ArrayList(SearchResult)) !void {
     var line_num: u32 = 0;
+    var file_hits: usize = 0;
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         line_num += 1;
@@ -2363,7 +2345,8 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
                 .line_num = line_num,
                 .line_text = line_text,
             });
-            if (result_list.items.len >= max_results) return;
+            file_hits += 1;
+            if (file_hits >= max_per_file or result_list.items.len >= max_results) return;
         }
     }
 }
