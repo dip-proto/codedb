@@ -6092,3 +6092,108 @@ test "issue-179: Python multi-line docstring with def inside" {
     try testing.expectEqual(@as(usize, 0), inner.len);
 }
 
+
+test "issue-262: sparse+trigram intersection drops files only in trigram index" {
+    // When both sparse and trigram indices return candidates, searchContent
+    // intersects them.  A file present in trigram candidates but absent from
+    // sparse candidates is silently dropped — a recall loss.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    // Index two files — both contain the query.
+    try explorer.indexFile("a.zig", "fn recall_target_alpha() void {}");
+    try explorer.indexFile("b.zig", "fn recall_target_alpha() void {} // more text here for variety");
+
+    // Simulate sparse index missing file "b.zig" (e.g. boundary misalignment).
+    // File b.zig remains in the trigram index but not in sparse.
+    explorer.sparse_ngram_index.removeFile("b.zig");
+
+    const results = try explorer.searchContent("recall_target_alpha", testing.allocator, 50);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    // Both files contain the query — both must appear.
+    try testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "issue-263: skip_trigram_files searched before max_results exhausted" {
+    // Files indexed with skip_trigram=true are only searched after all
+    // trigram/sparse/word paths are exhausted.  When a single normal file
+    // has enough matches to fill max_results, the skip_trigram file is
+    // never checked — even though it contains relevant content.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    // Normal file with 6 matches (one per line).
+    try explorer.indexFile("noisy.zig",
+        \\fn my_unique_func() void {}
+        \\fn my_unique_func_v2() void {}
+        \\const my_unique_func_ptr = undefined;
+        \\var my_unique_func_state = 0;
+        \\test "my_unique_func works" {}
+        \\// calls my_unique_func internally
+    );
+
+    // skip-trigram file with 1 match.
+    try explorer.indexFileSkipTrigram("large.zig", "fn my_unique_func() void {}");
+
+    // max_results=5: the normal file fills the quota, skip_trigram never searched.
+    const results = try explorer.searchContent("my_unique_func", testing.allocator, 5);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    // The skip_trigram file must be represented in results.
+    var found_large = false;
+    for (results) |r| {
+        if (std.mem.eql(u8, r.path, "large.zig")) found_large = true;
+    }
+    try testing.expect(found_large);
+}
+
+test "issue-264: early exit at max_results misses valid matches in remaining candidates" {
+    // searchContent stops as soon as result_list.items.len >= max_results.
+    // The first-indexed file is iterated first (doc_id order).  If it has
+    // many matches it fills the quota alone, and later files are never checked.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    // Index noisy file FIRST — it will be the first trigram candidate.
+    try explorer.indexFile("noisy.zig",
+        \\fn target_token() void {}
+        \\fn target_token_v2() void {}
+        \\const target_token_ptr = undefined;
+        \\var target_token_state = 0;
+        \\test "target_token works" {}
+        \\// calls target_token internally
+    );
+
+    // Index quiet file SECOND — it will be a later candidate.
+    try explorer.indexFile("quiet.zig", "fn target_token() void {}");
+
+    // max_results=5: noisy.zig has 6 matches, fills the quota.
+    const results = try explorer.searchContent("target_token", testing.allocator, 5);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    // quiet.zig must be represented in results even though noisy.zig
+    // has enough matches to fill max_results by itself.
+    var found_quiet = false;
+    for (results) |r| {
+        if (std.mem.eql(u8, r.path, "quiet.zig")) found_quiet = true;
+    }
+    try testing.expect(found_quiet);
+}
