@@ -2355,25 +2355,58 @@ pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
 }
 
 fn searchInContent(path: []const u8, content: []const u8, query: []const u8, allocator: std.mem.Allocator, max_per_file: usize, max_results: usize, result_list: *std.ArrayList(SearchResult)) !void {
-    var line_num: u32 = 0;
+    if (query.len == 0 or content.len == 0) return;
+
+    // Scan the whole buffer for matches, extract line info only on hit.
+    const first_lower: u8 = if (query[0] >= 'A' and query[0] <= 'Z') query[0] + 32 else query[0];
+    const first_upper: u8 = if (query[0] >= 'a' and query[0] <= 'z') query[0] - 32 else query[0];
     var file_hits: usize = 0;
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |line| {
-        line_num += 1;
-        if (indexOfCaseInsensitive(line, query) != null) {
-            const line_text = try allocator.dupe(u8, line);
-            errdefer allocator.free(line_text);
-            const path_copy = try allocator.dupe(u8, path);
-            errdefer allocator.free(path_copy);
-            try result_list.append(allocator, .{
-                .path = path_copy,
-                .line_num = line_num,
-                .line_text = line_text,
-            });
-            file_hits += 1;
-            if (file_hits >= max_per_file or result_list.items.len >= max_results) return;
+    var pos: usize = 0;
+
+    while (pos + query.len <= content.len) {
+        // Fast first-byte scan to find potential match positions.
+        const c = content[pos];
+        if (c != first_lower and c != first_upper) {
+            pos += 1;
+            continue;
         }
+
+        // Check if full query matches at this position.
+        if (!matchAtCaseInsensitive(content, pos, query)) {
+            pos += 1;
+            continue;
+        }
+
+        // Match found — extract line boundaries and line number.
+        const line_start = if (std.mem.lastIndexOfScalar(u8, content[0..pos], '\n')) |nl| nl + 1 else 0;
+        const line_end = if (std.mem.indexOfScalarPos(u8, content, pos, '\n')) |nl| nl else content.len;
+        const line_num: u32 = @intCast(std.mem.count(u8, content[0..line_start], "\n") + 1);
+
+        const line_text = try allocator.dupe(u8, content[line_start..line_end]);
+        errdefer allocator.free(line_text);
+        const path_copy = try allocator.dupe(u8, path);
+        errdefer allocator.free(path_copy);
+        try result_list.append(allocator, .{
+            .path = path_copy,
+            .line_num = line_num,
+            .line_text = line_text,
+        });
+        file_hits += 1;
+        if (file_hits >= max_per_file or result_list.items.len >= max_results) return;
+
+        // Skip to next line to avoid duplicate matches on the same line.
+        pos = line_end + 1;
     }
+}
+
+fn matchAtCaseInsensitive(content: []const u8, pos: usize, query: []const u8) bool {
+    if (pos + query.len > content.len) return false;
+    for (0..query.len) |j| {
+        const hc = if (content[pos + j] >= 'A' and content[pos + j] <= 'Z') content[pos + j] + 32 else content[pos + j];
+        const nc = if (query[j] >= 'A' and query[j] <= 'Z') query[j] + 32 else query[j];
+        if (hc != nc) return false;
+    }
+    return true;
 }
 
 fn searchInContentRegex(path: []const u8, content: []const u8, pattern: []const u8, allocator: std.mem.Allocator, max_results: usize, result_list: *std.ArrayList(SearchResult)) !void {
