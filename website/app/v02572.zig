@@ -217,7 +217,6 @@ const html =
     \\      <div class="chart-card"><h3>Search latency (ms)</h3><canvas id="searchChart"></canvas></div>
     \\      <div class="chart-card"><h3>Results returned (log scale)</h3><canvas id="resultsChart"></canvas></div>
     \\    </div>
-    \\    <p style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:16px;">Note: Internal search times measured. codedb trigram lookup ~500µs. ripgrep/grep cold disk scan 500-1,500ms. MCP overhead (JSON-RPC) adds ~20ms for codedb, not shown here.</p>
     \\  </div>
     \\</div>
     \\<div class="timeline-section" style="background:var(--dark2);color:#fff;">
