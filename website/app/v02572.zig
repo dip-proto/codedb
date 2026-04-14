@@ -198,10 +198,10 @@ const html =
     \\    <table class="bench-table" style="color:var(--text);">
     \\      <thead><tr><th>Tool</th><th>Internal search</th><th>Results</th><th>Approach</th><th>vs codedb</th></tr></thead>
     \\      <tbody>
-        \\        <tr><td><strong>codedb v0.2.572</strong> (Zig)</td><td class="fast">~500 µs</td><td>20 (limited)</td><td>Warm trigram</td><td class="fast">baseline</td></tr>
-        \\        <tr><td>fff-mcp 0.5.2 (Rust)</td><td class="fast">~500 µs</td><td>limited (lower recall)</td><td>Bigram + frecency</td><td>competitive — 2–6× fewer results</td></tr>
-        \\        <tr><td>ripgrep 15.1</td><td>~500 ms</td><td>~48,000 (all)</td><td>Disk scan</td><td>1,000× slower</td></tr>
-        \\        <tr><td>GNU grep</td><td>~1,500 ms</td><td>~48,200 (all)</td><td>Disk scan</td><td>3,000× slower</td></tr>
+        \\        <tr><td><strong>codedb v0.2.572</strong> (Zig)</td><td class="fast">~220 µs</td><td>12 files (22% recall)</td><td>Warm trigram</td><td class="fast">baseline</td></tr>
+        \\        <tr><td>fff-mcp 0.5.2 (Rust)</td><td>~510 µs</td><td>2 files (4% recall)</td><td>Bigram + frecency</td><td>2.3× slower, 6× fewer files</td></tr>
+        \\        <tr><td>ripgrep 15.1</td><td>~500 ms</td><td>~48,000 lines (all)</td><td>Disk scan</td><td>2,272× slower</td></tr>
+        \\        <tr><td>GNU grep</td><td>~1,500 ms</td><td>~48,200 lines (all)</td><td>Disk scan</td><td>6,818× slower</td></tr>
     \\      </tbody>
     \\    </table>
     \\    <div style="background:var(--dark3);border-radius:8px;padding:20px;margin:24px 0;border-left:3px solid var(--accent);">
@@ -280,12 +280,12 @@ const html =
     \\  });
     \\  new Chart(document.getElementById('searchChart'), {
     \\    type: 'bar',
-    \\    data: { labels: ["codedb", "fff-mcp", "ripgrep", "grep"], datasets: [{ data: [0.5, 0.5, 500, 1500], backgroundColor: [green, "#3b82f6", "#9ca3af", gray], borderRadius: 4, barThickness: 32 }] },
+    \\    data: { labels: ["codedb (0.22ms)", "fff-mcp (0.51ms)", "ripgrep (~500ms)", "grep (~1500ms)"], datasets: [{ data: [0.22, 0.51, 500, 1500], backgroundColor: [green, "#3b82f6", "#9ca3af", gray], borderRadius: 4, barThickness: 32 }] },
     \\    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { title: { display: true, text: 'ms (linear scale)' }, grid: { color: '#f3f4f6' } }, y: { grid: { display: false }, ticks: { font: { family: "'Geist', sans-serif", size: 13, weight: 600 }, color: '#111' } } } }
     \\  });
     \\  new Chart(document.getElementById('resultsChart'), {
     \\    type: 'bar',
-    \\    data: { labels: ["codedb (20)", "fff-mcp (~8)", "ripgrep (~48k)", "grep (~48k)"], datasets: [{ data: [20, 8, 48000, 48200], backgroundColor: [green, "#3b82f6", "#9ca3af", gray], borderRadius: 4, barThickness: 32 }] },
+    \\    data: { labels: ["codedb (12 files)", "fff-mcp (2 files)", "ripgrep (~48k lines)", "grep (~48k lines)"], datasets: [{ data: [12, 2, 48000, 48200], backgroundColor: [green, "#3b82f6", "#9ca3af", gray], borderRadius: 4, barThickness: 32 }] },
     \\    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { title: { display: true, text: 'results (linear scale)' }, grid: { color: '#f3f4f6' } }, y: { grid: { display: false }, ticks: { font: { family: "'Geist', sans-serif", size: 13, weight: 600 }, color: '#111' } } } }
     \\  });
     \\  document.getElementById('burger')?.addEventListener('click', function() { this.classList.toggle('open'); document.getElementById('nav-links').classList.toggle('open'); });
