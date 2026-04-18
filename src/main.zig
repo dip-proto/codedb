@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const compat = @import("compat.zig");
+const cio = @import("cio.zig");
 const Store = @import("store.zig").Store;
 const AgentRegistry = @import("agent.zig").AgentRegistry;
 const Explorer = @import("explore.zig").Explorer;
@@ -23,7 +23,7 @@ const release_info = @import("release_info.zig");
 
 /// Thin wrapper: format + write to a File via allocator.
 const Out = struct {
-    file: std.fs.File,
+    file: cio.File,
     alloc: std.mem.Allocator,
 
     fn p(self: Out, comptime fmt: []const u8, args: anytype) void {
@@ -38,7 +38,8 @@ const Out = struct {
 /// so we trampoline through a thread with an explicit 64 MB stack.
 /// In optimised builds the merged frame is ~190 KB, so 8 MB is ample and
 /// avoids triggering Rosetta 2's 64 MB stack allocation bug on x86_64-macos.
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
+    cio.setProcessArgs(init.args.vector);
     const stack_size: usize = if (builtin.mode == .Debug) 64 * 1024 * 1024 else 8 * 1024 * 1024;
     const thread = try std.Thread.spawn(.{ .stack_size = stack_size }, mainInner, .{});
     thread.join();
@@ -50,18 +51,24 @@ fn mainInner() void {
         std.process.exit(1);
     };
 }
-
 fn mainImpl() !void {
     // Use c_allocator (libc malloc) — better page reclamation than GPA
     const allocator = std.heap.c_allocator;
 
-    const stdout = std.fs.File.stdout();
+    // 0.16: single Threaded I/O instance passed down through every subsystem
+    // that touches fs/subprocess. See issue #282. `io` flows into mcp.run,
+    // update.run, nuke.run, watcher.initialScan, server.serve, Store, Explorer.
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const stdout = cio.File.stdout();
     const use_color = stdout.isTty();
     const s = sty.style(use_color);
     const out = Out{ .file = stdout, .alloc = allocator };
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try cio.argsAlloc(allocator);
+    defer cio.argsFree(allocator, args);
 
     var root: []const u8 = undefined;
     var cmd: []const u8 = undefined;
@@ -113,13 +120,13 @@ fn mainImpl() !void {
 
     // Handle update command early — before root resolution so it works from anywhere.
     if (std.mem.eql(u8, cmd, "update")) {
-        update_mod.run(stdout, s, allocator);
+        update_mod.run(io, stdout, s, allocator);
         return;
     }
 
     // Handle nuke command early — before root resolution so it works from anywhere
     if (std.mem.eql(u8, cmd, "nuke")) {
-        nuke_mod.run(stdout, s, allocator);
+        nuke_mod.run(io, stdout, s, allocator);
         return;
     }
 
@@ -128,7 +135,7 @@ fn mainImpl() !void {
     }
 
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_root = resolveRoot(root, &root_buf) catch {
+    const abs_root = resolveRoot(io, root, &root_buf) catch {
         out.p("{s}\xe2\x9c\x97{s} cannot resolve root: {s}{s}{s}\n", .{
             s.red, s.reset, s.bold, root, s.reset,
         });
@@ -141,7 +148,7 @@ fn mainImpl() !void {
         std.process.exit(1);
     }
 
-    const data_dir = try getDataDir(allocator, abs_root);
+    const data_dir = try getDataDir(io, allocator, abs_root);
     defer allocator.free(data_dir);
 
     var store = Store.init(allocator);
@@ -149,12 +156,12 @@ fn mainImpl() !void {
 
     const data_log_path = try std.fmt.allocPrint(allocator, "{s}/data.log", .{data_dir});
     defer allocator.free(data_log_path);
-    store.openDataLog(data_log_path) catch |err| {
+    store.openDataLog(io, data_log_path) catch |err| {
         std.log.warn("could not open data log at {s}: {}", .{ data_log_path, err });
     };
 
     var explorer = Explorer.init(allocator);
-    explorer.setRoot(root);
+    explorer.setRoot(io, root);
     defer explorer.deinit();
 
     // Per-project frequency table for sparse n-gram boundary selection.
@@ -171,25 +178,25 @@ fn mainImpl() !void {
 
         // Try loading from codedb.snapshot if it exists and git HEAD matches.
         const snapshot_path = "codedb.snapshot";
-        const snapshot_t0 = std.time.nanoTimestamp();
+        const snapshot_t0 = cio.nanoTimestamp();
         const snapshot_loaded = blk: {
-            const snap_head = snapshot_mod.readSnapshotGitHead(snapshot_path) orelse {
+            const snap_head = snapshot_mod.readSnapshotGitHead(io, snapshot_path) orelse {
                 // No git HEAD in snapshot (non-git project or missing) — load if current project also has no git
                 if (git_head != null) break :blk false;
-                break :blk snapshot_mod.loadSnapshot(snapshot_path, &explorer, &store, allocator);
+                break :blk snapshot_mod.loadSnapshot(io, snapshot_path, &explorer, &store, allocator);
             };
             const cur_head = git_head orelse break :blk false;
             if (!std.mem.eql(u8, &snap_head, &cur_head)) break :blk false;
-            break :blk snapshot_mod.loadSnapshot(snapshot_path, &explorer, &store, allocator);
+            break :blk snapshot_mod.loadSnapshot(io, snapshot_path, &explorer, &store, allocator);
         };
-        const snapshot_elapsed = std.time.nanoTimestamp() - snapshot_t0;
+        const snapshot_elapsed = cio.nanoTimestamp() - snapshot_t0;
 
         const needs_word_index = std.mem.eql(u8, cmd, "word");
         if (snapshot_loaded) {
             if (std.mem.eql(u8, cmd, "search")) {
-                loadTrigramFromDiskIfPresent(&explorer, data_dir, allocator);
+                loadTrigramFromDiskIfPresent(io, &explorer, data_dir, allocator);
             } else if (std.mem.eql(u8, cmd, "word")) {
-                loadWordIndexFromDiskIfPresent(&explorer, data_dir, git_head, allocator);
+                loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
             }
             var dur_buf: [64]u8 = undefined;
             out.p("{s}\xe2\x9c\x93{s} {s}loaded snapshot{s}  {s}{d} files{s}  {s}{s}{s}\n", .{
@@ -200,19 +207,19 @@ fn mainImpl() !void {
                 sty.formatDuration(&dur_buf, snapshot_elapsed), s.reset,
             });
         } else {
-            const disk_hdr = TrigramIndex.readDiskHeader(data_dir, allocator) catch null;
+            const disk_hdr = TrigramIndex.readDiskHeader(io, data_dir, allocator) catch null;
             const heads_match = blk2: {
                 const a = git_head orelse break :blk2 false;
                 const b = (disk_hdr orelse break :blk2 false).git_head orelse break :blk2 false;
                 break :blk2 std.mem.eql(u8, &a, &b);
             };
             // Load per-project freq table before scan so pairWeight is project-aware.
-            if (index_mod.readFrequencyTable(data_dir, allocator) catch null) |ft| {
+            if (index_mod.readFrequencyTable(io, data_dir, allocator) catch null) |ft| {
                 freq_table_heap = ft;
                 index_mod.setFrequencyTable(ft);
             }
 
-            const t_scan = std.time.nanoTimestamp();
+            const t_scan = cio.nanoTimestamp();
             // Use page_allocator for word index during scan — freed pages
             // return to OS immediately instead of c_allocator retention.
             explorer.mu.lock();
@@ -227,12 +234,12 @@ fn mainImpl() !void {
             // For other commands: outline-only scan, trigrams from disk or rebuild.
             const is_search = std.mem.eql(u8, cmd, "search");
             if (is_search and !heads_match) {
-                const tmp_tri = try watcher.initialScanWithTrigrams(&store, &explorer, root, allocator, std.heap.c_allocator, true);
+                const tmp_tri = try watcher.initialScanWithTrigrams(io, &store, &explorer, root, allocator, std.heap.c_allocator, true);
                 if (tmp_tri) |tri| {
-                    tri.writeToDisk(data_dir, git_head) catch {};
+                    tri.writeToDisk(io, data_dir, git_head) catch {};
                     tri.deinit();
                     std.heap.c_allocator.destroy(tri);
-                    if (MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
+                    if (MmapTrigramIndex.initFromDisk(io, data_dir, allocator)) |loaded| {
                         explorer.mu.lock();
                         explorer.trigram_index.deinit();
                         explorer.trigram_index = .{ .mmap = loaded };
@@ -240,9 +247,9 @@ fn mainImpl() !void {
                     }
                 }
             } else {
-                try watcher.initialScan(&store, &explorer, root, allocator, true);
+                try watcher.initialScan(io, &store, &explorer, root, allocator, true);
             }
-            const scan_elapsed = std.time.nanoTimestamp() - t_scan;
+            const scan_elapsed = cio.nanoTimestamp() - t_scan;
             var dur_buf: [64]u8 = undefined;
             out.p("{s}\xe2\x9c\x93{s} {s}indexed{s}  {s}{s}{s}\n", .{
                 s.green,                            s.reset,
@@ -255,83 +262,57 @@ fn mainImpl() !void {
                 // Verify file count then load trigram from disk via mmap
                 const current_count = @as(u32, @intCast(explorer.outlines.count()));
                 if (disk_hdr != null and current_count == disk_hdr.?.file_count) {
-                    if (MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
+                    if (MmapTrigramIndex.initFromDisk(io, data_dir, allocator)) |loaded| {
                         explorer.mu.lock();
                         explorer.trigram_index.deinit();
                         explorer.trigram_index = .{ .mmap = loaded };
                         explorer.mu.unlock();
-                    } else if (TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
+                    } else if (TrigramIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
                         explorer.mu.lock();
                         explorer.trigram_index.deinit();
                         explorer.trigram_index = .{ .heap = loaded };
                         explorer.mu.unlock();
                     } else {
                         explorer.rebuildTrigrams() catch {};
-                        explorer.trigram_index.writeToDisk(data_dir, git_head) catch |err| {
+                        explorer.trigram_index.writeToDisk(io, data_dir, git_head) catch |err| {
                             std.log.warn("could not persist trigram index: {}", .{err});
                         };
                     }
                 } else {
                     explorer.rebuildTrigrams() catch {};
-                    explorer.trigram_index.writeToDisk(data_dir, git_head) catch |err| {
+                    explorer.trigram_index.writeToDisk(io, data_dir, git_head) catch |err| {
                         std.log.warn("could not persist trigram index: {}", .{err});
                     };
                 }
             } else if (!is_search) {
-                // Cold run (non-search): persist word index → free → build trigrams → reload.
-                // This prevents word index + trigram index from coexisting in memory.
-                explorer.releaseContents();
-                if (needs_word_index) persistWordIndexToDisk(&explorer, data_dir, git_head);
+                // Cold run (non-search): persist word index, then build trigrams
+                // in parallel from the content already cached in Explorer.contents
+                // — no second pass over the filesystem.
                 if (needs_word_index) {
-                    explorer.mu.lock();
-                    explorer.word_index.deinit();
-                    explorer.word_index = WordIndex.init(allocator);
-                    explorer.mu.unlock();
+                    persistWordIndexToDisk(io, &explorer, data_dir, git_head);
+                    explorer.markWordIndexAsComplete();
                 }
-                {
-                    // Build trigrams — read files from disk, index one at a time.
-                    // Uses c_allocator so freed pages return to OS on resize.
-                    var tmp_tri = TrigramIndex.init(std.heap.c_allocator);
-
-                    // Collect outline paths for parallel access
-                    var paths: std.ArrayList([]const u8) = .{};
-                    defer paths.deinit(allocator);
-                    {
-                        var key_iter = explorer.outlines.keyIterator();
-                        while (key_iter.next()) |k| {
-                            paths.append(allocator, k.*) catch {};
-                        }
+                const cpu_count = std.Thread.getCpuCount() catch 1;
+                const tri_workers: usize = @min(@as(usize, @intCast(cpu_count)), 8);
+                const tmp_tri = watcher.buildTrigramsFromCache(&explorer.contents, allocator, std.heap.c_allocator, tri_workers) catch null;
+                if (tmp_tri) |tri| {
+                    defer {
+                        tri.deinit();
+                        std.heap.c_allocator.destroy(tri);
                     }
-
-                    var tri_dir = std.fs.cwd().openDir(root, .{}) catch null;
-                    defer if (tri_dir) |*d| d.close();
-                    if (tri_dir) |dir| {
-                        for (paths.items) |p| {
-                            const f = dir.openFile(p, .{}) catch continue;
-                            defer f.close();
-                            var fa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-                            defer fa.deinit();
-                            const c = f.readToEndAlloc(fa.allocator(), 512 * 1024) catch continue;
-                            if (c.len <= 64 * 1024) {
-                                tmp_tri.indexFile(p, c) catch continue;
-                            }
-                        }
-                    }
-                    // Write + free
-                    tmp_tri.writeToDisk(data_dir, git_head) catch |err| {
+                    tri.writeToDisk(io, data_dir, git_head) catch |err| {
                         std.log.warn("could not persist trigram index: {}", .{err});
                     };
-                    tmp_tri.deinit();
                 }
-                // Load trigrams as mmap (zero heap cost)
-                if (MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
+                // Load trigrams as mmap (zero heap cost); then we can safely
+                // release file contents since mmap serves future searches.
+                if (MmapTrigramIndex.initFromDisk(io, data_dir, allocator)) |loaded| {
                     explorer.mu.lock();
                     explorer.trigram_index.deinit();
                     explorer.trigram_index = .{ .mmap = loaded };
                     explorer.mu.unlock();
                 }
-                // Reload word index from disk
-                loadWordIndexFromDiskIfPresent(&explorer, data_dir, git_head, allocator);
+                explorer.releaseContents();
             }
 
             // If no freq table was loaded, build one from indexed content and
@@ -339,7 +320,7 @@ fn mainImpl() !void {
             if (freq_table_heap == null) {
                 if (explorer.contents.count() > 0) {
                     const ft = index_mod.buildFrequencyTableFromMap(&explorer.contents);
-                    index_mod.writeFrequencyTable(&ft, data_dir) catch |err| {
+                    index_mod.writeFrequencyTable(io, &ft, data_dir) catch |err| {
                         std.log.warn("could not persist frequency table: {}", .{err});
                     };
                 }
@@ -348,10 +329,10 @@ fn mainImpl() !void {
     }
 
     if (std.mem.eql(u8, cmd, "tree")) {
-        const t0 = std.time.nanoTimestamp();
+        const t0 = cio.nanoTimestamp();
         const tree = try explorer.getTree(allocator, use_color);
         defer allocator.free(tree);
-        const elapsed = std.time.nanoTimestamp() - t0;
+        const elapsed = cio.nanoTimestamp() - t0;
         var dur_buf: [64]u8 = undefined;
         out.p("{s}", .{tree});
         out.p("{s}{s}{s}\n", .{
@@ -364,7 +345,7 @@ fn mainImpl() !void {
             });
             std.process.exit(1);
         };
-        const t0 = std.time.nanoTimestamp();
+        const t0 = cio.nanoTimestamp();
         var outline = explorer.getOutline(path, allocator) catch {
             out.p("{s}\xe2\x9c\x97{s} {s}{s}{s} \xe2\x80\x94 failed to load outline\n", .{
                 s.red, s.reset, s.bold, path, s.reset,
@@ -377,7 +358,7 @@ fn mainImpl() !void {
             return;
         };
         defer outline.deinit();
-        const elapsed = std.time.nanoTimestamp() - t0;
+        const elapsed = cio.nanoTimestamp() - t0;
         var dur_buf: [64]u8 = undefined;
         const lang = @tagName(outline.language);
         out.p("{s}\xe2\x9c\x93{s} {s}{s}{s}  {s}{s}{s}  {s}{d} lines{s}  {s}{s}{s}\n", .{
@@ -408,14 +389,14 @@ fn mainImpl() !void {
             });
             std.process.exit(1);
         };
-        const t0 = std.time.nanoTimestamp();
+        const t0 = cio.nanoTimestamp();
         if (try explorer.findSymbol(name, allocator)) |r| {
             defer {
                 allocator.free(r.path);
                 allocator.free(r.symbol.name);
                 if (r.symbol.detail) |d| allocator.free(d);
             }
-            const elapsed = std.time.nanoTimestamp() - t0;
+            const elapsed = cio.nanoTimestamp() - t0;
             var dur_buf: [64]u8 = undefined;
             const kind = @tagName(r.symbol.kind);
             out.p("{s}\xe2\x9c\x93{s} {s}{s}{s} {s}{s}{s}  {s}{s}{s}:{s}{d}{s}  {s}{s}{s}\n", .{
@@ -450,7 +431,7 @@ fn mainImpl() !void {
             });
             std.process.exit(1);
         };
-        const t0 = std.time.nanoTimestamp();
+        const t0 = cio.nanoTimestamp();
         const results = if (use_regex)
             try explorer.searchContentRegex(query, allocator, 50)
         else
@@ -462,7 +443,7 @@ fn mainImpl() !void {
             }
             allocator.free(results);
         }
-        const elapsed = std.time.nanoTimestamp() - t0;
+        const elapsed = cio.nanoTimestamp() - t0;
         var dur_buf: [64]u8 = undefined;
         if (results.len == 0) {
             out.p("{s}\xe2\x9c\x97{s} no results for {s}\"{s}\"{s}\n", .{
@@ -493,10 +474,10 @@ fn mainImpl() !void {
             });
             std.process.exit(1);
         };
-        const t0 = std.time.nanoTimestamp();
+        const t0 = cio.nanoTimestamp();
         const hits = try explorer.searchWord(word, allocator);
         defer allocator.free(hits);
-        const elapsed = std.time.nanoTimestamp() - t0;
+        const elapsed = cio.nanoTimestamp() - t0;
         var dur_buf: [64]u8 = undefined;
         if (hits.len == 0) {
             out.p("{s}\xe2\x9c\x97{s} no hits for {s}'{s}'{s}\n", .{
@@ -521,13 +502,13 @@ fn mainImpl() !void {
             }
         }
     } else if (std.mem.eql(u8, cmd, "hot")) {
-        const t0 = std.time.nanoTimestamp();
+        const t0 = cio.nanoTimestamp();
         const hot = try explorer.getHotFiles(&store, allocator, 10);
         defer {
             for (hot) |path| allocator.free(path);
             allocator.free(hot);
         }
-        const elapsed = std.time.nanoTimestamp() - t0;
+        const elapsed = cio.nanoTimestamp() - t0;
         var dur_buf: [64]u8 = undefined;
         out.p("{s}\xe2\x9c\x93{s} {s}recently modified{s}  {s}{s}{s}\n", .{
             s.green,                       s.reset,
@@ -542,22 +523,22 @@ fn mainImpl() !void {
             });
         }
     } else if (std.mem.eql(u8, cmd, "snapshot")) {
-        const t0 = std.time.nanoTimestamp();
+        const t0 = cio.nanoTimestamp();
         const output = if (args.len > cmd_args_start) args[cmd_args_start] else "codedb.snapshot";
-        snapshot_mod.writeSnapshotDual(&explorer, abs_root, output, allocator) catch |err| {
+        snapshot_mod.writeSnapshotDual(io, &explorer, abs_root, output, allocator) catch |err| {
             out.p("{s}\xe2\x9c\x97{s} snapshot failed: {}\n", .{ s.red, s.reset, err });
             std.process.exit(1);
         };
         const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
-        loadWordIndexFromDiskIfPresent(&explorer, data_dir, git_head, allocator);
+        loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
         if (!explorer.wordIndexIsComplete()) {
             explorer.rebuildWordIndex() catch |err| {
                 out.p("{s}\xe2\x9c\x97{s} word index rebuild failed: {}\n", .{ s.red, s.reset, err });
                 std.process.exit(1);
             };
         }
-        persistWordIndexToDisk(&explorer, data_dir, git_head);
-        const elapsed = std.time.nanoTimestamp() - t0;
+        persistWordIndexToDisk(io, &explorer, data_dir, git_head);
+        const elapsed = cio.nanoTimestamp() - t0;
         var dur_buf: [64]u8 = undefined;
         out.p("{s}\xe2\x9c\x93{s} {s}snapshot{s}  {s}{s}{s}  {s}{d} files{s}  {s}{s}{s}\n", .{
             s.green,                       s.reset,
@@ -581,35 +562,35 @@ fn mainImpl() !void {
         const queue = try allocator.create(watcher.EventQueue);
         defer allocator.destroy(queue);
         queue.* = watcher.EventQueue{};
-        const watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ &store, &explorer, queue, root, &shutdown, &scan_already_done });
+        const watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ io, &store, &explorer, queue, root, &shutdown, &scan_already_done });
         defer watch_thread.join();
 
         const reap_thread = try std.Thread.spawn(.{}, reapLoop, .{ &agents, &shutdown });
         defer reap_thread.join();
 
         std.log.info("codedb: {d} files indexed, listening on :{d}", .{ store.currentSeq(), port });
-        try server.serve(allocator, &store, &agents, &explorer, queue, port);
+        try server.serve(io, allocator, &store, &agents, &explorer, queue, port);
     } else if (std.mem.eql(u8, cmd, "mcp")) {
         var agents = AgentRegistry.init(allocator);
         defer agents.deinit();
         _ = try agents.register("__filesystem__");
 
-        saveProjectInfo(allocator, data_dir, abs_root) catch {};
+        saveProjectInfo(io, allocator, data_dir, abs_root) catch {};
 
         // Set up query tracking WAL
         const query_log = std.fmt.allocPrint(allocator, "{s}/queries.log", .{data_dir}) catch null;
         if (query_log) |ql| mcp_server.setQueryLogPath(ql);
 
         const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
-        const startup_t0 = std.time.milliTimestamp();
+        const startup_t0 = cio.milliTimestamp();
         const snapshot_loaded = blk: {
-            const snap_head = snapshot_mod.readSnapshotGitHead("codedb.snapshot") orelse {
+            const snap_head = snapshot_mod.readSnapshotGitHead(io, "codedb.snapshot") orelse {
                 if (git_head != null) break :blk false;
-                break :blk snapshot_mod.loadSnapshot("codedb.snapshot", &explorer, &store, allocator);
+                break :blk snapshot_mod.loadSnapshot(io, "codedb.snapshot", &explorer, &store, allocator);
             };
             const cur_head = git_head orelse break :blk false;
             if (!std.mem.eql(u8, &snap_head, &cur_head)) break :blk false;
-            break :blk snapshot_mod.loadSnapshot("codedb.snapshot", &explorer, &store, allocator);
+            break :blk snapshot_mod.loadSnapshot(io, "codedb.snapshot", &explorer, &store, allocator);
         };
         var telemetry_disabled = false;
         for (args[cmd_args_start..]) |arg| {
@@ -619,7 +600,7 @@ fn mainImpl() !void {
             }
         }
 
-        var telem = telemetry.Telemetry.init(data_dir, allocator, telemetry_disabled);
+        var telem = telemetry.Telemetry.init(io, data_dir, allocator, telemetry_disabled);
         defer telem.deinit();
         telem.recordSessionStart();
 
@@ -631,19 +612,19 @@ fn mainImpl() !void {
         queue.* = watcher.EventQueue{};
         var scan_thread: ?std.Thread = null;
         if (!snapshot_loaded) {
-            scan_thread = try std.Thread.spawn(.{}, scanBg, .{ &store, &explorer, root, allocator, &scan_done, &shutdown, data_dir, abs_root, &telem, startup_t0 });
+            scan_thread = try std.Thread.spawn(.{}, scanBg, .{ io, &store, &explorer, root, allocator, &scan_done, &shutdown, data_dir, abs_root, &telem, startup_t0 });
         } else {
-            const startup_time_ms: u64 = @intCast(@max(std.time.milliTimestamp() - startup_t0, 0));
-            loadTrigramFromDiskIfPresent(&explorer, data_dir, allocator);
+            const startup_time_ms: u64 = @intCast(@max(cio.milliTimestamp() - startup_t0, 0));
+            loadTrigramFromDiskIfPresent(io, &explorer, data_dir, allocator);
             telem.recordCodebaseStats(&explorer, startup_time_ms);
         }
 
-        const watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ &store, &explorer, queue, root, &shutdown, &scan_done });
+        const watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ io, &store, &explorer, queue, root, &shutdown, &scan_done });
         const idle_thread = try std.Thread.spawn(.{}, idleWatchdog, .{&shutdown});
 
         std.log.info("codedb mcp: root={s} files={d} data={s}", .{ abs_root, store.currentSeq(), data_dir });
 
-        mcp_server.run(allocator, &store, &explorer, &agents, abs_root, &telem);
+        mcp_server.run(io, allocator, &store, &explorer, &agents, abs_root, &telem);
 
         shutdown.store(true, .release);
         if (scan_thread) |st| st.join();
@@ -664,38 +645,38 @@ fn isCommand(arg: []const u8) bool {
     return false;
 }
 
-fn resolveRoot(root: []const u8, buf: *[std.fs.max_path_bytes]u8) ![]const u8 {
-    if (std.mem.eql(u8, root, ".")) {
-        return std.fs.cwd().realpath(".", buf) catch return error.ResolveFailed;
-    }
-    return std.fs.cwd().realpath(root, buf) catch return error.ResolveFailed;
+fn resolveRoot(io: std.Io, root: []const u8, buf: *[std.fs.max_path_bytes]u8) ![]const u8 {
+    const sub = if (std.mem.eql(u8, root, ".")) "." else root;
+    const n = std.Io.Dir.cwd().realPathFile(io, sub, buf) catch return error.ResolveFailed;
+    return buf[0..n];
 }
 
-fn getDataDir(allocator: std.mem.Allocator, abs_root: []const u8) ![]u8 {
+fn getDataDir(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8) ![]u8 {
     const hash = std.hash.Wyhash.hash(0, abs_root);
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch {
+    const home_env = cio.posixGetenv("HOME") orelse {
         return std.fmt.allocPrint(allocator, "{s}/.codedb", .{abs_root});
     };
+    const home = try allocator.dupe(u8, home_env);
     defer allocator.free(home);
     const dir = try std.fmt.allocPrint(allocator, "{s}/.codedb/projects/{x}", .{ home, hash });
-    compat.makePath(std.fs.cwd(), dir) catch |err| {
+    std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
         std.log.warn("could not create data dir {s}: {}", .{ dir, err });
     };
     return dir;
 }
 
-fn loadTrigramFromDiskIfPresent(explorer: *Explorer, data_dir: []const u8, allocator: std.mem.Allocator) void {
+fn loadTrigramFromDiskIfPresent(io: std.Io, explorer: *Explorer, data_dir: []const u8, allocator: std.mem.Allocator) void {
     explorer.mu.lockShared();
     const already_loaded = explorer.trigram_index.fileCount() > 0;
     explorer.mu.unlockShared();
     if (already_loaded) return;
 
-    if (MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
+    if (MmapTrigramIndex.initFromDisk(io, data_dir, allocator)) |loaded| {
         explorer.mu.lock();
         defer explorer.mu.unlock();
         explorer.trigram_index.deinit();
         explorer.trigram_index = .{ .mmap = loaded };
-    } else if (TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
+    } else if (TrigramIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
         explorer.mu.lock();
         defer explorer.mu.unlock();
         explorer.trigram_index.deinit();
@@ -704,6 +685,7 @@ fn loadTrigramFromDiskIfPresent(explorer: *Explorer, data_dir: []const u8, alloc
 }
 
 fn loadWordIndexFromDiskIfPresent(
+    io: std.Io,
     explorer: *Explorer,
     data_dir: []const u8,
     current_git_head: ?[40]u8,
@@ -711,7 +693,7 @@ fn loadWordIndexFromDiskIfPresent(
 ) void {
     if (!explorer.wordIndexCanLoadFromDisk()) return;
 
-    const header = WordIndex.readDiskHeader(data_dir, allocator) catch null orelse {
+    const header = WordIndex.readDiskHeader(io, data_dir, allocator) catch null orelse {
         explorer.disableWordIndexDiskLoad();
         return;
     };
@@ -734,18 +716,18 @@ fn loadWordIndexFromDiskIfPresent(
         return;
     }
 
-    if (WordIndex.readFromDisk(data_dir, allocator)) |loaded| {
+    if (WordIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
         explorer.replaceWordIndex(loaded);
     } else {
         explorer.disableWordIndexDiskLoad();
     }
 }
 
-fn persistWordIndexToDisk(explorer: *Explorer, data_dir: []const u8, git_head: ?[40]u8) void {
+fn persistWordIndexToDisk(io: std.Io, explorer: *Explorer, data_dir: []const u8, git_head: ?[40]u8) void {
     const generation = explorer.wordIndexGenerationToPersist() orelse return;
 
     explorer.mu.lockShared();
-    explorer.word_index.writeToDisk(data_dir, git_head) catch |err| {
+    explorer.word_index.writeToDisk(io, data_dir, git_head) catch |err| {
         explorer.mu.unlockShared();
         std.log.warn("could not persist word index: {}", .{err});
         return;
@@ -754,12 +736,12 @@ fn persistWordIndexToDisk(explorer: *Explorer, data_dir: []const u8, git_head: ?
     explorer.markWordIndexPersisted(generation);
 }
 
-fn saveProjectInfo(allocator: std.mem.Allocator, data_dir: []const u8, abs_root: []const u8) !void {
+fn saveProjectInfo(io: std.Io, allocator: std.mem.Allocator, data_dir: []const u8, abs_root: []const u8) !void {
     const info_path = try std.fmt.allocPrint(allocator, "{s}/project.txt", .{data_dir});
     defer allocator.free(info_path);
-    const file = try std.fs.cwd().createFile(info_path, .{});
-    defer file.close();
-    try file.writeAll(abs_root);
+    const file = try std.Io.Dir.cwd().createFile(io, info_path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, abs_root);
 }
 
 fn printUsage(out: Out, s: sty.Style) void {
@@ -824,22 +806,22 @@ fn reapLoop(agents: *AgentRegistry, shutdown: *std.atomic.Value(bool)) void {
         // Sleep in 1s increments for responsive shutdown (was 5s)
         for (0..5) |_| {
             if (shutdown.load(.acquire)) return;
-            std.Thread.sleep(std.time.ns_per_s);
+            cio.sleepMs(1000);
         }
         agents.reapStale(30_000);
     }
 }
 
-fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.mem.Allocator, scan_done: *std.atomic.Value(bool), shutdown: *std.atomic.Value(bool), data_dir: []const u8, abs_root: []const u8, telem: *telemetry.Telemetry, startup_t0: i64) void {
+fn scanBg(io: std.Io, store: *Store, explorer: *Explorer, root: []const u8, allocator: std.mem.Allocator, scan_done: *std.atomic.Value(bool), shutdown: *std.atomic.Value(bool), data_dir: []const u8, abs_root: []const u8, telem: *telemetry.Telemetry, startup_t0: i64) void {
     const git_head = git_mod.getGitHead(root, allocator) catch null;
-    const disk_hdr = TrigramIndex.readDiskHeader(data_dir, allocator) catch null;
+    const disk_hdr = TrigramIndex.readDiskHeader(io, data_dir, allocator) catch null;
     const heads_match = blk: {
         const a = git_head orelse break :blk false;
         const b = (disk_hdr orelse break :blk false).git_head orelse break :blk false;
         break :blk std.mem.eql(u8, &a, &b);
     };
 
-    watcher.initialScan(store, explorer, root, allocator, heads_match) catch |err| {
+    watcher.initialScan(io, store, explorer, root, allocator, heads_match) catch |err| {
         std.log.warn("background scan failed: {}", .{err});
     };
 
@@ -848,24 +830,24 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
         scan_done.store(true, .release);
         return;
     }
-    persistWordIndexToDisk(explorer, data_dir, git_head);
+    persistWordIndexToDisk(io, explorer, data_dir, git_head);
 
     if (heads_match) {
         const current_count = @as(u32, @intCast(explorer.outlines.count()));
         if (disk_hdr != null and current_count == disk_hdr.?.file_count) {
-            if (MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
+            if (MmapTrigramIndex.initFromDisk(io, data_dir, allocator)) |loaded| {
                 explorer.mu.lock();
                 explorer.trigram_index.deinit();
                 explorer.trigram_index = .{ .mmap = loaded };
                 explorer.mu.unlock();
                 scan_done.store(true, .release);
                 if (shutdown.load(.acquire)) return;
-                telem.recordCodebaseStats(explorer, @intCast(@max(std.time.milliTimestamp() - startup_t0, 0)));
-                snapshot_mod.writeSnapshotDual(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
+                telem.recordCodebaseStats(explorer, @intCast(@max(cio.milliTimestamp() - startup_t0, 0)));
+                snapshot_mod.writeSnapshotDual(io, explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
                     std.log.warn("could not auto-write snapshot: {}", .{err});
                 };
                 const fc = explorer.outlines.count();
-                if (fc > 1000 or std.process.hasEnvVarConstant("CODEDB_LOW_MEMORY")) {
+                if (fc > 1000 or cio.posixGetenv("CODEDB_LOW_MEMORY") != null) {
                     explorer.releaseContents();
                     explorer.releaseSecondaryIndexes();
                 }
@@ -874,19 +856,19 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
                 explorer.word_index.shrinkAllocations();
                 return;
             }
-            if (TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
+            if (TrigramIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
                 explorer.mu.lock();
                 explorer.trigram_index.deinit();
                 explorer.trigram_index = .{ .heap = loaded };
                 explorer.mu.unlock();
                 scan_done.store(true, .release);
                 if (shutdown.load(.acquire)) return;
-                telem.recordCodebaseStats(explorer, @intCast(@max(std.time.milliTimestamp() - startup_t0, 0)));
-                snapshot_mod.writeSnapshotDual(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
+                telem.recordCodebaseStats(explorer, @intCast(@max(cio.milliTimestamp() - startup_t0, 0)));
+                snapshot_mod.writeSnapshotDual(io, explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
                     std.log.warn("could not auto-write snapshot: {}", .{err});
                 };
                 const fc = explorer.outlines.count();
-                if (fc > 1000 or std.process.hasEnvVarConstant("CODEDB_LOW_MEMORY")) {
+                if (fc > 1000 or cio.posixGetenv("CODEDB_LOW_MEMORY") != null) {
                     explorer.releaseContents();
                     explorer.releaseSecondaryIndexes();
                 }
@@ -902,7 +884,7 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
         return;
     }
 
-    explorer.trigram_index.writeToDisk(data_dir, git_head) catch |err| {
+    explorer.trigram_index.writeToDisk(io, data_dir, git_head) catch |err| {
         std.log.warn("could not persist trigram index: {}", .{err});
     };
 
@@ -913,12 +895,12 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
     }
 
     // Compact: swap heap index for mmap — zero RSS, data lives in OS page cache.
-    if (MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
+    if (MmapTrigramIndex.initFromDisk(io, data_dir, allocator)) |loaded| {
         explorer.mu.lock();
         explorer.trigram_index.deinit();
         explorer.trigram_index = .{ .mmap = loaded };
         explorer.mu.unlock();
-    } else if (TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
+    } else if (TrigramIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
         explorer.mu.lock();
         explorer.trigram_index.deinit();
         explorer.trigram_index = .{ .heap = loaded };
@@ -929,13 +911,13 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
 
     if (shutdown.load(.acquire)) return;
 
-    telem.recordCodebaseStats(explorer, @intCast(@max(std.time.milliTimestamp() - startup_t0, 0)));
+    telem.recordCodebaseStats(explorer, @intCast(@max(cio.milliTimestamp() - startup_t0, 0)));
 
-    snapshot_mod.writeSnapshotDual(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
+    snapshot_mod.writeSnapshotDual(io, explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
         std.log.warn("could not auto-write snapshot: {}", .{err});
     };
     const file_count = explorer.outlines.count();
-    if (file_count > 1000 or std.process.hasEnvVarConstant("CODEDB_LOW_MEMORY")) {
+    if (file_count > 1000 or cio.posixGetenv("CODEDB_LOW_MEMORY") != null) {
         explorer.releaseContents();
         explorer.releaseSecondaryIndexes();
     }
@@ -946,11 +928,11 @@ fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
         // Sleep in 1s increments for responsive shutdown
         for (0..10) |_| {
             if (shutdown.load(.acquire)) return;
-            std.Thread.sleep(std.time.ns_per_s);
+            cio.sleepMs(1000);
         }
 
         // Quick liveness check: poll stdin for POLLHUP (client disconnected)
-        const stdin = std.fs.File.stdin();
+        const stdin = cio.File.stdin();
         var poll_fds = [_]std.posix.pollfd{.{
             .fd = stdin.handle,
             .events = std.posix.POLL.IN | std.posix.POLL.HUP,
@@ -959,7 +941,7 @@ fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
         const poll_result = std.posix.poll(&poll_fds, 0) catch 0;
         if (poll_result > 0 and (poll_fds[0].revents & std.posix.POLL.HUP) != 0) {
             std.log.info("stdin closed (client disconnected), exiting", .{});
-            stdin.close();
+            _ = std.c.close(stdin.handle);
             shutdown.store(true, .release);
             return;
         }
@@ -967,10 +949,10 @@ fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
         // Fallback: idle timeout
         const last = mcp.last_activity.load(.acquire);
         if (last == 0) continue;
-        const now = std.time.milliTimestamp();
+        const now = cio.milliTimestamp();
         if (now - last > mcp.idle_timeout_ms) {
             std.log.info("idle for {d}s, exiting", .{@divTrunc(now - last, 1000)});
-            stdin.close();
+            _ = std.c.close(stdin.handle);
             shutdown.store(true, .release);
             return;
         }

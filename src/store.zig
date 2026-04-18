@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("compat.zig");
+const cio = @import("cio.zig");
 const AgentId = @import("agent.zig").AgentId;
 const version = @import("version.zig");
 const Version = version.Version;
@@ -18,9 +18,10 @@ pub const Store = struct {
     files: std.StringHashMap(FileVersions),
     seq: u64,
     allocator: std.mem.Allocator,
-    mu: std.Thread.Mutex = .{},
-    data_log: ?std.fs.File = null,
+    mu: cio.Mutex = .{},
+    data_log: ?std.Io.File = null,
     data_log_pos: u64 = 0,
+    io: ?std.Io = null,
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{
@@ -37,17 +38,21 @@ pub const Store = struct {
             entry.value_ptr.deinit();
         }
         self.files.deinit();
-        if (self.data_log) |f| f.close();
+        if (self.data_log) |f| {
+            if (self.io) |io| f.close(io);
+        }
     }
 
-    pub fn openDataLog(self: *Store, path: []const u8) !void {
+    pub fn openDataLog(self: *Store, io: std.Io, path: []const u8) !void {
         // Extract parent dir and ensure it exists
         if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| {
-            compat.makePath(std.fs.cwd(), path[0..sep]) catch {};
+            std.Io.Dir.cwd().createDirPath(io, path[0..sep]) catch {};
         }
-        self.data_log = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = false });
-        const stat = try compat.fileStat(self.data_log.?);
-        self.data_log_pos = stat.size;
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false });
+        self.data_log = file;
+        self.io = io;
+        const sz = try file.length(io);
+        self.data_log_pos = sz;
     }
 
     pub fn recordSnapshot(self: *Store, path: []const u8, size: u64, hash: u64) !u64 {
@@ -80,21 +85,21 @@ pub const Store = struct {
         var data_len: u32 = 0;
         if (diff) |d| {
             if (self.data_log) |log| {
+                const io = self.io orelse return error.Unexpected;
                 // Advisory lock for cross-process safety
                 const locked = blk: {
-                    log.lock(.exclusive) catch break :blk false;
+                    log.lock(io, .exclusive) catch break :blk false;
                     break :blk true;
                 };
-                defer if (locked) log.unlock();
+                defer if (locked) log.unlock(io);
 
                 // Re-stat to get current end position (another process may have appended)
-                const stat = compat.fileStat(log) catch return error.Unexpected;
-                self.data_log_pos = stat.size;
+                const end_pos = log.length(io) catch return error.Unexpected;
+                self.data_log_pos = end_pos;
 
                 data_offset = self.data_log_pos;
                 data_len = @intCast(d.len);
-                try log.seekTo(self.data_log_pos);
-                try log.writeAll(d);
+                try log.writePositionalAll(io, d, self.data_log_pos);
                 self.data_log_pos += d.len;
             }
         }
@@ -102,7 +107,7 @@ pub const Store = struct {
         try entry.value_ptr.versions.append(self.allocator, .{
             .seq = next_seq,
             .agent = agent,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = cio.milliTimestamp(),
             .op = op,
             .hash = hash,
             .size = size,
@@ -161,7 +166,7 @@ pub const Store = struct {
     pub fn changesSinceDetailed(self: *Store, since: u64, allocator: std.mem.Allocator) ![]const ChangeEntry {
         self.mu.lock();
         defer self.mu.unlock();
-        var result: std.ArrayList(ChangeEntry) = .{};
+        var result: std.ArrayList(ChangeEntry) = .empty;
         errdefer result.deinit(allocator);
         var iter = self.files.iterator();
         while (iter.next()) |entry| {
@@ -197,7 +202,7 @@ pub const Store = struct {
         self.mu.lock();
         defer self.mu.unlock();
 
-        var paths: std.ArrayList([]const u8) = .{};
+        var paths: std.ArrayList([]const u8) = .empty;
         var iter = self.files.iterator();
         while (iter.next()) |entry| {
             try paths.append(self.allocator, entry.key_ptr.*);

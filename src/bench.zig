@@ -1,4 +1,5 @@
 const std = @import("std");
+const cio = @import("cio.zig");
 const Store = @import("store.zig").Store;
 const Explorer = @import("explore.zig").Explorer;
 const AgentRegistry = @import("agent.zig").AgentRegistry;
@@ -39,31 +40,35 @@ const cases = [_]Case{
     .{ .tool = .codedb_find, .name = "codedb_find", .args_json = "{\"query\":\"main\"}", .iterations = 100 },
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init.Minimal) !void {
+    cio.setProcessArgs(init.args.vector);
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     const emit_json = blk: {
-        const args = try std.process.argsAlloc(allocator);
-        defer std.process.argsFree(allocator, args);
+        const args = try cio.argsAlloc(allocator);
+        defer cio.argsFree(allocator, args);
         for (args[1..]) |arg| {
             if (std.mem.eql(u8, arg, "--json")) break :blk true;
         }
         break :blk false;
     };
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
     var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_root = try tmp.dir.realpath(".", &tmp_path_buf);
+    const tmp_root = try makeTempCorpusDir(io, &tmp_path_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, tmp_root) catch {};
 
     var repo_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const repo_root = try std.fs.cwd().realpath(".", &repo_path_buf);
+    const repo_root_len = try std.Io.Dir.cwd().realPathFile(io, ".", &repo_path_buf);
+    const repo_root = repo_path_buf[0..repo_root_len];
 
-    try copyCorpus(allocator, repo_root, tmp_root);
-    try writeBenchTarget(tmp_root);
+    try copyCorpus(io, allocator, repo_root, tmp_root);
+    try writeBenchTarget(io, tmp_root);
 
     var store = Store.init(allocator);
     defer store.deinit();
@@ -75,7 +80,7 @@ pub fn main() !void {
     defer agents.deinit();
     _ = try agents.register("__filesystem__");
 
-    try watcher.initialScan(&store, &explorer, tmp_root, allocator, false);
+    try watcher.initialScan(io, &store, &explorer, tmp_root, allocator, false);
 
     var bench_ctx = mcp.BenchContext.init(allocator, tmp_root);
     defer bench_ctx.deinit();
@@ -95,8 +100,8 @@ pub fn main() !void {
     var results: [cases.len]ToolBench = undefined;
     for (cases, 0..) |case, idx| {
         const args = &args_store[idx].value.object;
-        const base = try runCase(allocator, &bench_ctx, &store, &explorer, &agents, case, args, &telem_off);
-        const with_telem = try runCase(allocator, &bench_ctx, &store, &explorer, &agents, case, args, &telem_on);
+        const base = try runCase(io, allocator, &bench_ctx, &store, &explorer, &agents, case, args, &telem_off);
+        const with_telem = try runCase(io, allocator, &bench_ctx, &store, &explorer, &agents, case, args, &telem_on);
         results[idx] = .{
             .tool = case.name,
             .avg_latency_ns = base.avg_latency_ns,
@@ -108,13 +113,14 @@ pub fn main() !void {
     }
 
     const corpus = summarizeCorpus(&explorer);
-    try writeHumanSummary(allocator, std.fs.File.stderr(), corpus.files, corpus.bytes, &results);
+    try writeHumanSummary(allocator, cio.File.stderr(), corpus.files, corpus.bytes, &results);
     if (emit_json) {
-        try writeJsonSummary(allocator, std.fs.File.stdout(), repo_root, tmp_root, corpus.files, corpus.bytes, &results);
+        try writeJsonSummary(allocator, cio.File.stdout(), repo_root, tmp_root, corpus.files, corpus.bytes, &results);
     }
 }
 
 fn runCase(
+    io: std.Io,
     allocator: std.mem.Allocator,
     bench_ctx: *mcp.BenchContext,
     store: *Store,
@@ -132,8 +138,8 @@ fn runCase(
             try resetBenchTarget(explorer, store);
         }
 
-        var timer = try std.time.Timer.start();
-        response_bytes = bench_ctx.runToolCall(allocator, case.name, case.tool, args, store, explorer, agents, telem);
+        var timer = try cio.Timer.start();
+        response_bytes = bench_ctx.runToolCall(io, allocator, case.name, case.tool, args, store, explorer, agents, telem);
         const elapsed = timer.read();
         total_ns +|= elapsed;
     }
@@ -144,7 +150,7 @@ fn runCase(
     };
 }
 
-fn copyCorpus(allocator: std.mem.Allocator, repo_root: []const u8, tmp_root: []const u8) !void {
+fn copyCorpus(io: std.Io, allocator: std.mem.Allocator, repo_root: []const u8, tmp_root: []const u8) !void {
     const files = [_][]const u8{
         "README.md",
         "build.zig",
@@ -176,19 +182,31 @@ fn copyCorpus(allocator: std.mem.Allocator, repo_root: []const u8, tmp_root: []c
         defer allocator.free(dst);
 
         if (std.fs.path.dirname(dst)) |parent| {
-            try std.fs.cwd().makePath(parent);
+            try std.Io.Dir.cwd().createDirPath(io, parent);
         }
 
-        try std.fs.cwd().copyFile(src, std.fs.cwd(), dst, .{});
+        try std.Io.Dir.copyFile(std.Io.Dir.cwd(), src, std.Io.Dir.cwd(), dst, io, .{});
     }
 }
 
-fn writeBenchTarget(tmp_root: []const u8) !void {
+
+fn makeTempCorpusDir(io: std.Io, buf: *[std.fs.max_path_bytes]u8) ![]const u8 {
+    const base = cio.posixGetenv("TMPDIR") orelse "/tmp";
+    const ns = cio.nanoTimestamp();
+    const seed: u64 = @intCast(@as(u128, @bitCast(ns)) & 0xffff_ffff_ffff_ffff);
+    const path = if (base.len > 0 and base[base.len - 1] == '/')
+        try std.fmt.bufPrint(buf, "{s}codedb-bench-{x}", .{ base, seed })
+    else
+        try std.fmt.bufPrint(buf, "{s}/codedb-bench-{x}", .{ base, seed });
+    try std.Io.Dir.cwd().createDirPath(io, path);
+    return path;
+}
+fn writeBenchTarget(io: std.Io, tmp_root: []const u8) !void {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/src/bench_target.zig", .{tmp_root});
-    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll("pub const bench_value = 1;\n");
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, "pub const bench_value = 1;\n");
 }
 
 fn resetBenchTarget(explorer: *Explorer, store: *Store) !void {
@@ -210,10 +228,10 @@ fn summarizeCorpus(explorer: *Explorer) struct { files: usize, bytes: u64 } {
     return .{ .files = files, .bytes = bytes };
 }
 
-fn writeHumanSummary(allocator: std.mem.Allocator, file: std.fs.File, file_count: usize, total_bytes: u64, results: []const ToolBench) !void {
-    var out: std.ArrayList(u8) = .{};
+fn writeHumanSummary(allocator: std.mem.Allocator, file: cio.File, file_count: usize, total_bytes: u64, results: []const ToolBench) !void {
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    const writer = out.writer(allocator);
+    const writer = cio.listWriter(&out, allocator);
     try writer.print("── E2E MCP Tool Benchmarks ({d} files, {d}KB) ──\n", .{ file_count, total_bytes / 1024 });
     try writer.writeAll("Tool              Latency    Size     Ops/sec   TelemetryΔ\n");
     for (results) |result| {
@@ -230,10 +248,10 @@ fn writeHumanSummary(allocator: std.mem.Allocator, file: std.fs.File, file_count
     try file.writeAll(out.items);
 }
 
-fn writeJsonSummary(allocator: std.mem.Allocator, file: std.fs.File, repo_root: []const u8, corpus_root: []const u8, file_count: usize, total_bytes: u64, results: []const ToolBench) !void {
-    var out: std.ArrayList(u8) = .{};
+fn writeJsonSummary(allocator: std.mem.Allocator, file: cio.File, repo_root: []const u8, corpus_root: []const u8, file_count: usize, total_bytes: u64, results: []const ToolBench) !void {
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    const writer = out.writer(allocator);
+    const writer = cio.listWriter(&out, allocator);
     try writer.print("{{\"repo_root\":\"{s}\",\"corpus_root\":\"{s}\",\"file_count\":{d},\"total_bytes\":{d},\"tools\":[", .{
         repo_root,
         corpus_root,

@@ -1,11 +1,12 @@
 const std = @import("std");
+const cio = @import("cio.zig");
 const Explorer = @import("explore.zig").Explorer;
 const Store = @import("store.zig").Store;
 
 pub fn buildSnapshot(explorer: *Explorer, store: *Store, alloc: std.mem.Allocator) ![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(alloc);
-    const w = buf.writer(alloc);
+    const w = cio.listWriter(&buf, alloc);
 
     try w.writeAll("{");
     try w.print("\"seq\":{d},", .{store.currentSeq()});
@@ -21,7 +22,7 @@ pub fn buildSnapshot(explorer: *Explorer, store: *Store, alloc: std.mem.Allocato
         explorer.mu.lockShared();
         defer explorer.mu.unlockShared();
 
-        var paths: std.ArrayList([]const u8) = .{};
+        var paths: std.ArrayList([]const u8) = .empty;
         defer paths.deinit(alloc);
         var iter = explorer.outlines.iterator();
         while (iter.next()) |entry| {
@@ -85,7 +86,7 @@ pub fn buildSnapshot(explorer: *Explorer, store: *Store, alloc: std.mem.Allocato
         while (oiter.next()) |entry| {
             for (entry.value_ptr.symbols.items) |sym| {
                 const gop = try sym_map.getOrPut(sym.name);
-                if (!gop.found_existing) gop.value_ptr.* = .{};
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
                 try gop.value_ptr.append(alloc, .{
                     .path = entry.key_ptr.*,
                     .line = sym.line_start,
@@ -94,7 +95,7 @@ pub fn buildSnapshot(explorer: *Explorer, store: *Store, alloc: std.mem.Allocato
             }
         }
 
-        var sym_keys: std.ArrayList([]const u8) = .{};
+        var sym_keys: std.ArrayList([]const u8) = .empty;
         defer sym_keys.deinit(alloc);
         var ski = sym_map.iterator();
         while (ski.next()) |e| try sym_keys.append(alloc, e.key_ptr.*);
@@ -128,7 +129,7 @@ pub fn buildSnapshot(explorer: *Explorer, store: *Store, alloc: std.mem.Allocato
         explorer.mu.lockShared();
         defer explorer.mu.unlockShared();
 
-        var dep_keys: std.ArrayList([]const u8) = .{};
+        var dep_keys: std.ArrayList([]const u8) = .empty;
         defer dep_keys.deinit(alloc);
         var diter = explorer.dep_graph.iterator();
         while (diter.next()) |e| try dep_keys.append(alloc, e.key_ptr.*);

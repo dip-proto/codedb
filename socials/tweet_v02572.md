@@ -1,126 +1,46 @@
-# codedb v0.2.572 launch tweets
+# codedb v0.2.572 social copy
 
-Best times to post (PST): Tue-Thu, 8-10 AM
-Best times to post (SGT): Tue-Thu, 11 PM - 1 AM
+## Tweet
 
----
+Hey guys!! I finally posted codedb here properly.
 
-Tweet 1 (Hook)
+codedb is a local code intelligence engine for AI agents, written in Zig.
 
-codedb v0.2.572 just dropped.
+v0.2.572 just shipped:
+220µs search on 6,315 files
+2.3x faster than fff-mcp
+6x better recall
+2,272x faster than ripgrep
 
-220µs search on 6,315 files. 2.3x faster than fff-mcp. 6x better recall. 2,272x faster than ripgrep.
+Deep dives:
+https://codegraff.com/blog/codedb-code-intelligence
+https://codegraff.com/blog/codedb-0-2-572
 
-12 SIMD optimizations. Zero std.json. Single-threaded Zig beating Rust + rayon.
+## LinkedIn
 
----
+Hey guys!! I haven't properly posted about codedb on LinkedIn yet, and since v0.2.572 just shipped I figured I'd do a proper intro.
 
-Tweet 2 (v0.2.56 vs v0.2.572)
+codedb is a local code intelligence engine for AI agents, written in Zig.
 
-v0.2.572 vs v0.2.56:
+The basic idea is simple. Every time an agent needs to understand a codebase, it usually shells out to grep or ripgrep, reads full files, and pushes raw text back into the prompt. The codebase barely changes between queries, but the agent keeps paying the same cost again and again in process startup, filesystem scans, latency, and token burn.
 
-10x faster cold indexing. 3.6s to 346ms.
-83% less cold RSS. 3.5GB to 580MB.
-92% less warm RSS. 1.9GB to 150MB.
-220µs search instead of cold disk scans.
+codedb indexes a repo once on startup, keeps structural information in memory, and serves it back over MCP. So instead of rescanning the filesystem every time, an agent can ask directly for symbol outlines, exact identifier hits, dependency edges, file trees, structured reads, and edits.
 
----
+That is why it feels fast. The win is not just wall-clock latency. It is also that the responses are shaped for agents instead of dumping giant walls of raw text into the context window.
 
-Tweet 3 (Recall)
+v0.2.572 is a good snapshot of where the project is right now. On 6,315 files, search is down to 220µs. That is 2.3x faster than fff-mcp, 6x better recall on the comparison query, and 2,272x faster than ripgrep.
 
-fff-mcp uses word-boundary grep. Search "manager", miss "DatabaseManager".
+If you want the full write-up, I published two posts on Codegraff.
 
-codedb uses a trigram index. Finds substrings. 6x more files returned on the same query.
+Why codedb feels instant for agents:
+https://codegraff.com/blog/codedb-code-intelligence
 
-Same latency. Way more results.
+codedb 0.2.572:
+https://codegraff.com/blog/codedb-0-2-572
 
----
+codedb is open source here:
+https://github.com/justrach/codedb
 
-Tweet 4 (SIMD engine)
+I think AI agents should have the same kind of structural code intelligence that IDEs have had for years. codedb is my attempt to make that available everywhere, not just inside one editor.
 
-12 search engine changes in v0.2.572:
-
-16-byte @Vector memmem scanner. SIMD newline detection. Tiered search: trigram, sparse, word, full scan. Lazy sparse. Size-sorted candidates. Per-file result cap. Deferred searched HashMap.
-
-O(1) everywhere it matters.
-
----
-
-Tweet 5 (MCP layer)
-
-MCP layer in v0.2.572:
-
-Zero std.json, scanner-based extraction for all request types. Arena allocator with reusable buffers. Single stdout write per response. Buffered stdin reads.
-
-Every round-trip is faster.
-
----
-
-Tweet 6 (vs the competition)
-
-Real benchmarks on openclaw (6,315 files), query "fn":
-
-codedb:  220µs, 12 files (22% recall)
-fff-mcp: 510µs, 2 files (4% recall)
-ripgrep: ~500ms, ~48,000 lines
-grep:    ~1,500ms, ~48,200 lines
-
-2.3x faster than fff-mcp. 6x better recall. 2,272x faster than ripgrep.
-
----
-
-Tweet 7 (Contributors)
-
-18 issues closed. 10 contributors.
-
-@JF10R @ocordeiro @destroyer22719 @wilsonsilva @killop @sims1253 @JustFly1984 @mochadwi @Mavis2103
-
-Thank you.
-
----
-
-Tweet 8 (CTA)
-
-Update:
-
-codedb update
-
-Fresh install:
-curl -fsSL https://codedb.codegraff.com/install.sh | bash
-
-macOS: signed + notarized. Linux: x86_64.
-
----
-
-Single tweet version
-
-codedb v0.2.572: 220µs search. 2.3x faster than fff-mcp (Rust+rayon). 6x better recall. 2,272x faster than ripgrep.
-
-12 SIMD optimizations. Zero std.json. Pure Zig.
-
-codedb update
-
----
-
-Thread starter
-
-codedb v0.2.572.
-
-220µs. 6,315 files. Query "fn".
-2.3x faster than fff-mcp.
-6x better recall than fff-mcp.
-2,272x faster than ripgrep.
-
-Thread ↓
-
----
-
-Hashtags
-
-#codedb #zig #ai #mcp #codeintelligence #devtools #performance
-
----
-
-Link
-
-https://github.com/justrach/codedb/releases/tag/v0.2.572
+#codedb #zig #ai #mcp #devtools
